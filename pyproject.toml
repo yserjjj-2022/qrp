@@ -1,0 +1,42 @@
+[project]
+name = "qa-interview-analyzer"
+version = "0.1.0"
+description = "Анализатор интервью: тематический анализ транскриптов"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.scripts]
+qa-pipeline = "qa.cli:main"
+
+[tool.uv]
+package = true
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+    "mypy>=1.10",
+    "pre-commit>=4.0",
+    "types-PyYAML>=6.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

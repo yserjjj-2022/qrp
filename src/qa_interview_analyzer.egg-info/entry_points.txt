@@ -1,0 +1,2 @@
+[console_scripts]
+qa-pipeline = qa.cli:main

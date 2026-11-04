@@ -1,0 +1,17 @@
+# Конфигурация проекта «анализатор интервью»
+# Переопределяет значения по умолчанию. Секреты — только в .env.
+
+db_path: data/interviews.db
+data_dir: data
+log_level: INFO
+
+llm:
+  provider: stub
+  model: null
+  endpoint: null
+  max_calls_per_run: 100
+  cache_dir: data/cache
+
+vectors:
+  backend: stub
+  model: null

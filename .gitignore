@@ -1,0 +1,21 @@
+# Virtual environment
+.venv/
+
+# Environment secrets
+.env
+
+# Data (transcripts, codebooks, backups)
+data/
+
+# Cache
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
