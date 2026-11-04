@@ -8,10 +8,15 @@ src/qa/db/__init__.py
 src/qa/db/connection.py
 src/qa/db/migrations.py
 src/qa/llm/__init__.py
+src/qa/llm/base.py
+src/qa/llm/stub.py
 src/qa/pipeline/__init__.py
 src/qa/pipeline/load_codebook.py
+src/qa/pipeline/load_themes.py
 src/qa/report/__init__.py
 src/qa/vectors/__init__.py
+src/qa/vectors/base.py
+src/qa/vectors/stub.py
 src/qa_interview_analyzer.egg-info/PKG-INFO
 src/qa_interview_analyzer.egg-info/SOURCES.txt
 src/qa_interview_analyzer.egg-info/dependency_links.txt
@@ -19,5 +24,7 @@ src/qa_interview_analyzer.egg-info/entry_points.txt
 src/qa_interview_analyzer.egg-info/requires.txt
 src/qa_interview_analyzer.egg-info/top_level.txt
 tests/test_codebook.py
+tests/test_llm_vectors.py
 tests/test_migrations.py
 tests/test_skeleton.py
+tests/test_themes.py

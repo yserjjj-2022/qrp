@@ -8,6 +8,7 @@ log_level: INFO
 llm:
   provider: stub
   model: null
+  model_normalize: null
   endpoint: null
   max_calls_per_run: 100
   cache_dir: data/cache
@@ -15,3 +16,13 @@ llm:
 vectors:
   backend: stub
   model: null
+
+pipeline:
+  backchannel_max_words: 3
+  backchannel_words: ["угу", "ага", "да", "так", "ну", "ясно", "хорошо", "понятно", "мгм", "ага."]
+
+m1b:
+  filler_density_threshold: 0.05
+  len_ratio_min: 0.6
+  len_ratio_max: 1.1
+  review_sample_share: 0.10

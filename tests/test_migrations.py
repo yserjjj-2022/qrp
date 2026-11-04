@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -44,14 +45,23 @@ class TestMigrations:
     """Проверка системы миграций."""
 
     def test_empty_db(self, tmp_db: tuple[sqlite3.Connection, Path, Path]) -> None:
-        """Миграция создаёт все 15 таблиц на пустой БД."""
+        """Миграции создают все таблицы каркаса и M1a на пустой БД."""
         conn, db_path, tmp_path = tmp_db
         backup_dir = tmp_path / "backups"
         applied = migrate(conn, db_path, _MIGRATIONS_DIR, backup_dir)
-        assert len(applied) == 1
+        assert len(applied) == 2
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        for table in _TABLES:
+        for table in _TABLES + ["utterance"]:
             assert table in tables, f"Таблица {table} не найдена"
+        # Служебные таблицы-гарды удалены
+        assert "_guard_empty" not in tables
+        assert "_guard_fk" not in tables
+        # Колонки M1a в interview
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(interview)").fetchall()}
+        assert {"respondent_code", "group", "transcript_source"} <= cols
+        # Новый формат turn
+        turn_cols = {row[1] for row in conn.execute("PRAGMA table_info(turn)").fetchall()}
+        assert {"line_no", "start_sec", "speaker_role", "pii_flag"} <= turn_cols
 
     def test_idempotent(self, tmp_db: tuple[sqlite3.Connection, Path, Path]) -> None:
         """Повторное применение не создаёт ошибок."""
@@ -89,3 +99,24 @@ class TestMigrations:
         conn2.close()
         backups_after_second = len(list(backup_dir.glob("*.db")))
         assert backups_after_second == backups_after_first
+
+    def test_0002_aborts_on_nonempty_turn(self, tmp_path: Path) -> None:
+        """Миграция 0002 останавливается, если turn не пуста."""
+        db_path = tmp_path / "test.db"
+        # Применяем только 0001: копируем её в отдельный каталог
+        partial_dir = tmp_path / "migrations_partial"
+        partial_dir.mkdir()
+        shutil.copy(_MIGRATIONS_DIR / "0001_create_tables.sql", partial_dir)
+        conn = get_connection(db_path)
+        migrate(conn, db_path, partial_dir, tmp_path / "backups")
+        # Заполняем turn данными по старой схеме
+        conn.execute("INSERT INTO interview (id_external) VALUES ('IVX1')")
+        conn.execute("INSERT INTO turn (interview_id, speaker, text) VALUES (1, 'A', 'текст')")
+        conn.commit()
+        # Полная миграция должна остановиться на гарде пустоты
+        with pytest.raises(sqlite3.IntegrityError):
+            migrate(conn, db_path, _MIGRATIONS_DIR, tmp_path / "backups")
+        # 0002 не записана как применённая
+        applied = {row[0] for row in conn.execute("SELECT name FROM applied_migrations").fetchall()}
+        assert "0002_transcript_turns" not in applied
+        conn.close()

@@ -11,20 +11,36 @@
 |------|-----|----------|
 | id | INTEGER PRIMARY KEY | Автоинкремент |
 | id_external | TEXT NOT NULL UNIQUE | Внешний идентификатор |
-| name | TEXT | Имя/описание |
+| name | TEXT | Заголовок транскрипта |
+| respondent_code | TEXT | Код респондента (R01...) — миграция 0002 |
+| group | TEXT | Группа (ТОРГ / не торгующие) — миграция 0002 |
+| transcript_source | TEXT | Источник/тип расшифровки — миграция 0002 |
 | created_at | TIMESTAMP | Дата создания |
 
 ### turn
-Реплика (поворот) в разговоре.
+Запись транскрипта (строка формата `ЧЧ:ММ:СС`, схема после миграции 0002).
 
 | Поле | Тип | Описание |
 |------|-----|----------|
 | id | INTEGER PRIMARY KEY | Автоинкремент |
 | interview_id | INTEGER NOT NULL | Ссылка на interview |
-| speaker | TEXT | Идентификатор спикера (код) |
-| text | TEXT NOT NULL | Текст реплики |
-| question_id | INTEGER | Ссылка на вопрос |
-| created_at | TIMESTAMP | Дата создания |
+| line_no | INTEGER NOT NULL | Номер строки в исходном файле (L0) |
+| start_sec | INTEGER NOT NULL | Метка начала реплики в секундах |
+| speaker_role | TEXT NOT NULL | INTERVIEWER / RESPONDENT / OBSERVER |
+| text | TEXT NOT NULL | Текст L1 (псевдонимизированный) |
+| pii_flag | INTEGER NOT NULL DEFAULT 0 | Совпадение с шаблонами PII (на ручную проверку) |
+
+### utterance
+Сборная реплика: объединение подряд идущих записей одного говорящего (миграция 0002).
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| interview_id | INTEGER NOT NULL | Ссылка на interview |
+| speaker_role | TEXT NOT NULL | INTERVIEWER / RESPONDENT / OBSERVER |
+| text | TEXT NOT NULL | Текст L1 (объединение записей без вставок) |
+| turn_ids | TEXT NOT NULL | JSON-массив id записей turn |
+| is_backchannel | INTEGER NOT NULL DEFAULT 0 | Короткая вставка-подтверждение («угу» и т. п.) |
 
 ### fragment
 Фрагмент текста (сегмент для разметки).

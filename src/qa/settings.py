@@ -15,6 +15,7 @@ class LlmSettings(BaseModel):
 
     provider: str = "stub"
     model: str | None = None
+    model_normalize: str | None = None
     endpoint: str | None = None
     max_calls_per_run: int = Field(default=100, ge=1)
     cache_dir: str = "data/cache"
@@ -27,6 +28,24 @@ class VectorsSettings(BaseModel):
     model: str | None = None
 
 
+class PipelineSettings(BaseModel):
+    """Настройки сборки реплик (M1a)."""
+
+    backchannel_max_words: int = Field(default=3, ge=1)
+    backchannel_words: list[str] = Field(
+        default_factory=lambda: ["угу", "ага", "да", "так", "ну", "ясно", "хорошо", "понятно", "мгм"]
+    )
+
+
+class M1bSettings(BaseModel):
+    """Стартовые пороги нормализации L2 (M1b). Уточняются на золотом наборе."""
+
+    filler_density_threshold: float = Field(default=0.05, gt=0, le=1)
+    len_ratio_min: float = Field(default=0.6, gt=0)
+    len_ratio_max: float = Field(default=1.1, gt=0)
+    review_sample_share: float = Field(default=0.10, ge=0, le=1)
+
+
 class Settings(BaseModel):
     """Глобальные настройки проекта."""
 
@@ -35,6 +54,8 @@ class Settings(BaseModel):
     data_dir: str = "data"
     log_level: str = "INFO"
     vectors: VectorsSettings = VectorsSettings()
+    pipeline: PipelineSettings = PipelineSettings()
+    m1b: M1bSettings = M1bSettings()
 
     @field_validator("db_path")
     @classmethod
