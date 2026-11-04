@@ -5,8 +5,11 @@ src/qa/log.py
 src/qa/settings.py
 src/qa/dashboard/__init__.py
 src/qa/db/__init__.py
+src/qa/db/connection.py
+src/qa/db/migrations.py
 src/qa/llm/__init__.py
 src/qa/pipeline/__init__.py
+src/qa/pipeline/load_codebook.py
 src/qa/report/__init__.py
 src/qa/vectors/__init__.py
 src/qa_interview_analyzer.egg-info/PKG-INFO
@@ -15,4 +18,6 @@ src/qa_interview_analyzer.egg-info/dependency_links.txt
 src/qa_interview_analyzer.egg-info/entry_points.txt
 src/qa_interview_analyzer.egg-info/requires.txt
 src/qa_interview_analyzer.egg-info/top_level.txt
+tests/test_codebook.py
+tests/test_migrations.py
 tests/test_skeleton.py

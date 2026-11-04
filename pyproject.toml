@@ -23,6 +23,7 @@ dev = [
     "mypy>=1.10",
     "pre-commit>=4.0",
     "types-PyYAML>=6.0",
+    "types-openpyxl>=3.1",
 ]
 
 [tool.ruff]
@@ -40,3 +41,6 @@ disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "real_codebook: требует переменную окружения QA_REAL_CODEBOOK_PATH",
+]
