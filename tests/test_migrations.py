@@ -119,4 +119,18 @@ class TestMigrations:
         # 0002 не записана как применённая
         applied = {row[0] for row in conn.execute("SELECT name FROM applied_migrations").fetchall()}
         assert "0002_transcript_turns" not in applied
+        # Режим FK восстановлен после сбоя
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         conn.close()
+
+    def test_fk_enforced_after_migrations(self, tmp_db: tuple[sqlite3.Connection, Path, Path]) -> None:
+        """После миграций внешние ключи включены и проверяются."""
+        conn, db_path, tmp_path = tmp_db
+        migrate(conn, db_path, _MIGRATIONS_DIR, tmp_path / "backups")
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO utterance (interview_id, speaker_role, text, turn_ids)"
+                " VALUES (999, 'RESPONDENT', 'x', '[]')"
+            )

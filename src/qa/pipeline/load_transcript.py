@@ -97,6 +97,9 @@ def parse_transcript(path: Path) -> tuple[str, list[TranscriptRecord]]:
     if not lines:
         msg = "Файл транскрипта пуст"
         raise TranscriptParseError(msg)
+    if _LINE_RE.match(lines[0]):
+        msg = "Строка 1: отсутствует заголовок транскрипта (первая строка уже является записью)"
+        raise TranscriptParseError(msg)
 
     header = lines[0].strip()
     records: list[TranscriptRecord] = []
@@ -212,9 +215,16 @@ def build_utterances(
             current.parts.append(text)
             current.turn_ids.append(turn_id)
         elif current is not None and is_backchannel(text, backchannel_words, backchannel_max_words):
-            # Вставка другого говорящего: своя реплика-бэкканал, текущая продолжается
-            insert = UtteranceDraft(speaker_role=role, parts=[text], turn_ids=[turn_id], is_backchannel=True)
-            finished.append(insert)
+            # Вставка другого говорящего: своя реплика-бэкканал, текущая продолжается.
+            # Подряд идущие вставки одного говорящего объединяются между собой.
+            last = finished[-1] if finished else None
+            if last is not None and last.is_backchannel and last.speaker_role == role:
+                last.parts.append(text)
+                last.turn_ids.append(turn_id)
+            else:
+                finished.append(
+                    UtteranceDraft(speaker_role=role, parts=[text], turn_ids=[turn_id], is_backchannel=True)
+                )
         else:
             if current is not None:
                 finished.append(current)

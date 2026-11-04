@@ -114,8 +114,20 @@ class TestParse:
 
     def test_decreasing_time_raises(self, tmp_path: Path) -> None:
         path = tmp_path / "bad_time.txt"
-        path.write_text(_HEADER + "\n00:05:00\tМетка\tтекст\n00:04:00\tМетка\tтекст\n", encoding="utf-8")
+        path.write_text(_HEADER + "\n00:05:00	Метка	текст\n00:04:00	Метка	текст\n", encoding="utf-8")
         with pytest.raises(TranscriptParseError, match="убывает"):
+            parse_transcript(path)
+
+    def test_missing_header_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "no_header.txt"
+        path.write_text("00:00:01	Метка	текст\n", encoding="utf-8")
+        with pytest.raises(TranscriptParseError, match="Строка 1"):
+            parse_transcript(path)
+
+    def test_empty_file_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "empty.txt"
+        path.write_text("", encoding="utf-8")
+        with pytest.raises(TranscriptParseError, match="пуст"):
             parse_transcript(path)
 
     def test_meta_missing_field(self, tmp_path: Path) -> None:
@@ -198,6 +210,31 @@ class TestAssembly:
         drafts = build_utterances(turns, {"угу"}, 3)
         assert len(drafts) == 3
         assert all(not d.is_backchannel for d in drafts)
+
+    def test_consecutive_backchannels_merged(self) -> None:
+        turns = [
+            (1, "RESPONDENT", "начало"),
+            (2, "INTERVIEWER", "Угу."),
+            (3, "INTERVIEWER", "Да."),
+            (4, "RESPONDENT", "продолжение"),
+        ]
+        drafts = build_utterances(turns, {"угу", "да"}, 3)
+        assert len(drafts) == 2
+        assert drafts[0].turn_ids == [1, 4]
+        assert drafts[1].is_backchannel is True
+        assert drafts[1].turn_ids == [2, 3]
+        assert drafts[1].text == "Угу. Да."
+
+    def test_backchannel_not_lost_when_next_speaker_differs(self) -> None:
+        turns = [
+            (1, "RESPONDENT", "ответ"),
+            (2, "INTERVIEWER", "угу"),
+            (3, "OBSERVER", "замечание наблюдателя"),
+        ]
+        drafts = build_utterances(turns, {"угу"}, 3)
+        roles = [d.speaker_role for d in drafts]
+        assert roles == ["RESPONDENT", "INTERVIEWER", "OBSERVER"]
+        assert drafts[1].is_backchannel is True
 
 
 class TestLoadTranscript:

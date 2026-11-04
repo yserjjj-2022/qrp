@@ -13,12 +13,21 @@ from qa.log import setup_logging
 from qa.settings import Settings
 
 
+def _migrations_dir() -> Path:
+    """Каталог миграций: из корня репозитория, иначе из текущего каталога."""
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "migrations"
+    if candidate.is_dir():
+        return candidate
+    return Path.cwd() / "migrations"
+
+
 def _open_db(settings: Settings) -> sqlite3.Connection:
     """Открыть БД из настроек и применить миграции."""
     db_path = Path(settings.db_path)
     backup_dir = Path(settings.data_dir) / "backups"
     conn = get_connection(db_path)
-    migrate(conn, db_path, Path("migrations"), backup_dir)
+    migrate(conn, db_path, _migrations_dir(), backup_dir)
     return conn
 
 

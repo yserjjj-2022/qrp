@@ -32,6 +32,9 @@ def _get_applied(conn: sqlite3.Connection) -> set[str]:
 
 def _pending(migrations_dir: Path, applied: set[str]) -> list[Path]:
     """Отсортированные файлы миграций, которые ещё не применены."""
+    if not migrations_dir.is_dir():
+        msg = f"Каталог миграций не найден: {migrations_dir.resolve()}"
+        raise FileNotFoundError(msg)
     all_files = sorted(migrations_dir.glob("*.sql"), key=lambda p: p.name)
     return [p for p in all_files if p.stem not in applied]
 
@@ -81,7 +84,14 @@ def migrate(conn: sqlite3.Connection, db_path: Path, migrations_dir: Path, backu
     for migration_file in pending:
         sql = migration_file.read_text(encoding="utf-8")
         logger.info("Применяю миграцию: %s", migration_file.name)
-        conn.executescript(sql)
+        try:
+            conn.executescript(sql)
+        except sqlite3.Error:
+            # Миграция может отключать FK (пересоздание таблиц) — вернуть режим,
+            # чтобы соединение не осталось с ослабленными проверками.
+            conn.execute("PRAGMA foreign_keys=ON")
+            logger.error("Миграция %s не применена", migration_file.name)
+            raise
         conn.execute(f"INSERT INTO {_MIGRATIONS_TABLE} (name) VALUES (?)", (migration_file.stem,))
         conn.commit()
         applied_list.append(migration_file.stem)
