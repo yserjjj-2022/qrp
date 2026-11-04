@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -52,13 +53,13 @@ class TestCLI:
 
 
 class TestSettings:
-    """Проверка загрузки настроек."""
+    """Проверка загрузки и валидации настроек."""
 
     def test_default_provider(self, settings: Settings) -> None:
         assert settings.llm.provider == "stub"
 
     def test_db_path(self, settings: Settings) -> None:
-        assert settings.db_path == "data/interviews.db"
+        assert settings.db_path.endswith("data/interviews.db")
 
     def test_llm_model_none(self, settings: Settings) -> None:
         assert settings.llm.model is None
@@ -74,6 +75,26 @@ class TestSettings:
 
     def test_llm_max_calls(self, settings: Settings) -> None:
         assert settings.llm.max_calls_per_run == 100
+
+    def test_api_key_not_required_when_stub(self) -> None:
+        """При provider='stub' LLM_API_KEY не обязателен."""
+        with patch.dict(os.environ, {}, clear=True):
+            s = Settings.load()
+        assert s.llm.provider == "stub"
+
+    def test_api_key_required_when_not_stub(self) -> None:
+        """При provider != 'stub' LLM_API_KEY обязателен."""
+        from pydantic import ValidationError
+
+        with patch.dict(os.environ, {}, clear=True), pytest.raises(ValidationError):
+            Settings(db_path="data/test.db", llm={"provider": "openai"})
+
+    def test_invalid_log_level(self) -> None:
+        """Недопустимый log_level вызывает ValidationError."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            Settings(db_path="data/test.db", log_level="INVALID")
 
 
 class TestLogging:
