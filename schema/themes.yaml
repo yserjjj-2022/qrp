@@ -1,0 +1,48 @@
+# Дерево тем: анализатор интервью
+# Статус: draft (уточняется на пилоте)
+# Два узла: риски, ответственность
+# Каждый базовый код привязан ровно к одной теме или помечен «без темы»
+
+status: draft
+
+nodes:
+  - name: "Понимание рисков"
+    key: risks
+    themes:
+      - name: "Финансовые риски"
+        key: fin_risk
+        codes: []
+      - name: "Риски безопасности данных"
+        key: data_sec
+        codes: []
+      - name: "Риски потери контроля"
+        key: control_loss
+        codes: []
+      - name: "Риски непонимания"
+        key: misunderstanding
+        codes: []
+      - name: "Прочие риски"
+        key: other_risks
+        codes: []
+
+  - name: "Понимание и атрибуция ответственности"
+    key: responsibility
+    themes:
+      - name: "Ответственность пользователя"
+        key: user_resp
+        codes: []
+      - name: "Ответственность Финама"
+        key: finam_resp
+        codes: []
+      - name: "Ответственность ИИ"
+        key: ai_resp
+        codes: []
+      - name: "Разделённая ответственность"
+        key: shared_resp
+        codes: []
+      - name: "Прочая ответственность"
+        key: other_resp
+        codes: []
+
+# Коды без темы: коды, которые не попадают ни в одну тему
+no_theme: []
