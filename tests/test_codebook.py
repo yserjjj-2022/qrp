@@ -175,7 +175,9 @@ class TestRealCodebook:
         orphan_codes = db.execute(
             "SELECT c.name FROM code c LEFT JOIN question_code qc ON qc.code_id = c.id WHERE qc.id IS NULL"
         ).fetchall()
-        assert orphan_codes == []
+        # OTH — индуктивный код: в книге вместо вопросов стоит пометка «все»,
+        # связей с вопросами у него нет по замыслу. Остальные коды обязаны иметь связь.
+        assert [row[0] for row in orphan_codes] == ["OTH"]
         orphan_links = db.execute(
             "SELECT qc.id FROM question_code qc"
             " LEFT JOIN code c ON qc.code_id = c.id LEFT JOIN question q ON qc.question_id = q.id"

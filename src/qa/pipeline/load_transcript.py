@@ -241,11 +241,19 @@ def build_replacement_map(meta: InterviewMeta, extra_names: dict[str, str] | Non
 
     Имена из names_to_codes (приоритет) плюс внешняя таблица (NAMES_MAP_PATH).
     Метки говорящих тоже заменяются: респондент — на его код, остальные — на роль.
+
+    Пустое значение заменой не считается: заготовка таблицы «имя -> код» создаётся
+    с пустыми строками, и замена на них вырезала бы слова из текста. Такие ключи
+    отбрасываются, чтобы действовала замена по роли.
     """
-    mapping: dict[str, str] = dict(extra_names or {})
-    mapping.update(meta.names_to_codes)
+    mapping: dict[str, str] = {
+        surface: str(code) for surface, code in (extra_names or {}).items() if str(code or "").strip()
+    }
+    mapping.update({surface: str(code) for surface, code in meta.names_to_codes.items() if str(code or "").strip()})
     for label, role in meta.roles.items():
-        mapping.setdefault(label, meta.respondent_code if role == "RESPONDENT" else role)
+        fallback = meta.respondent_code if role == "RESPONDENT" else role
+        if not mapping.get(label):
+            mapping[label] = fallback
     return mapping
 
 
@@ -372,60 +380,24 @@ def load_transcript(
     safe_header = pseudonymize(header, replacement_map)
     group = normalize_group(meta.group, groups)
 
-    if existing is None:
-        interview_id_raw = conn.execute(
-            'INSERT INTO interview (id_external, name, respondent_code, "group", transcript_source, interview_date)'
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (meta.interview_id, safe_header, meta.respondent_code, group, meta.transcript_source, interview_date),
-        ).lastrowid
-        if interview_id_raw is None:
-            msg = "SQLite не вернул id вставленной строки interview"
-            raise sqlite3.Error(msg)
-        interview_id = int(interview_id_raw)
-    else:
-        interview_id = int(existing[0])
-        conn.execute(
-            'UPDATE interview SET name = ?, respondent_code = ?, "group" = ?,'
-            " transcript_source = COALESCE(?, transcript_source),"
-            " interview_date = COALESCE(?, interview_date) WHERE id = ?",
-            (safe_header, meta.respondent_code, group, meta.transcript_source, interview_date, interview_id),
+    # Запись идёт одной транзакцией: обрыв на середине не оставляет «наполовину
+    # загруженное» интервью, из-за которого повторный запуск счёл бы его готовым.
+    conn.execute("SAVEPOINT load_transcript")
+    try:
+        interview_id = _write_interview(
+            conn, meta, existing, safe_header=safe_header, group=group, interview_date=interview_date
         )
-        logger.info("Интервью %s дополнено записями транскрипта (id=%s)", meta.interview_id, interview_id)
-
-    for label, role in meta.roles.items():
-        words = sum(len(re.findall(r"[\w-]+", r.text, flags=re.UNICODE)) for r in records if r.speaker_label == label)
-        conn.execute(
-            "INSERT INTO interview_speaker (interview_id, speaker_label, role, words) VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(interview_id, speaker_label) DO UPDATE SET role = excluded.role, words = excluded.words",
-            (interview_id, label, role, words),
-        )
-
-    turns: list[tuple[int, str, str]] = []
-    n_pii = 0
-    for rec in records:
-        role = meta.roles[rec.speaker_label]
-        text = pseudonymize(rec.text, replacement_map)
-        pii = detect_pii(text)
-        n_pii += int(pii)
-        turn_id_raw = conn.execute(
-            "INSERT INTO turn (interview_id, line_no, start_sec, speaker_role, text, pii_flag)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (interview_id, rec.line_no, rec.start_sec, role, text, int(pii)),
-        ).lastrowid
-        if turn_id_raw is None:
-            msg = f"SQLite не вернул id вставленной строки turn (строка {rec.line_no})"
-            raise sqlite3.Error(msg)
-        turn_id = int(turn_id_raw)
-        turns.append((turn_id, role, text))
-
-    drafts = build_utterances(turns, set(pipeline.backchannel_words), pipeline.backchannel_max_words)
-    for draft in drafts:
-        conn.execute(
-            "INSERT INTO utterance (interview_id, speaker_role, text, turn_ids, is_backchannel) VALUES (?, ?, ?, ?, ?)",
-            (interview_id, draft.speaker_role, draft.text, json.dumps(draft.turn_ids), int(draft.is_backchannel)),
-        )
+        _write_speakers(conn, interview_id, records, meta)
+        turns = _write_turns(conn, interview_id, records, meta, replacement_map)
+        drafts = _write_utterances(conn, interview_id, turns, pipeline)
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT load_transcript")
+        conn.execute("RELEASE SAVEPOINT load_transcript")
+        raise
+    conn.execute("RELEASE SAVEPOINT load_transcript")
 
     conn.commit()
+    n_pii = sum(1 for _turn_id, _role, text in turns if detect_pii(text))
     logger.info(
         "Интервью %s загружено: turns=%s, utterances=%s, pii=%s",
         meta.interview_id,
@@ -440,6 +412,94 @@ def load_transcript(
         n_pii_flagged=n_pii,
         skipped=False,
     )
+
+
+def _write_interview(
+    conn: sqlite3.Connection,
+    meta: InterviewMeta,
+    existing: tuple[Any, ...] | None,
+    *,
+    safe_header: str,
+    group: str,
+    interview_date: str | None,
+) -> int:
+    """Создать строку интервью или дополнить существующую без записей."""
+    if existing is None:
+        interview_id_raw = conn.execute(
+            'INSERT INTO interview (id_external, name, respondent_code, "group", transcript_source, interview_date)'
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (meta.interview_id, safe_header, meta.respondent_code, group, meta.transcript_source, interview_date),
+        ).lastrowid
+        if interview_id_raw is None:
+            msg = "SQLite не вернул id вставленной строки interview"
+            raise sqlite3.Error(msg)
+        return int(interview_id_raw)
+
+    interview_id = int(existing[0])
+    conn.execute(
+        'UPDATE interview SET name = ?, respondent_code = ?, "group" = ?,'
+        " transcript_source = COALESCE(?, transcript_source),"
+        " interview_date = COALESCE(?, interview_date) WHERE id = ?",
+        (safe_header, meta.respondent_code, group, meta.transcript_source, interview_date, interview_id),
+    )
+    logger.info("Интервью %s дополнено записями транскрипта (id=%s)", meta.interview_id, interview_id)
+    return interview_id
+
+
+def _write_speakers(
+    conn: sqlite3.Connection,
+    interview_id: int,
+    records: list[TranscriptRecord],
+    meta: InterviewMeta,
+) -> None:
+    """Записать роли говорящих и число слов."""
+    for label, role in meta.roles.items():
+        words = sum(len(re.findall(r"[\w-]+", r.text, flags=re.UNICODE)) for r in records if r.speaker_label == label)
+        conn.execute(
+            "INSERT INTO interview_speaker (interview_id, speaker_label, role, words) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(interview_id, speaker_label) DO UPDATE SET role = excluded.role, words = excluded.words",
+            (interview_id, label, role, words),
+        )
+
+
+def _write_turns(
+    conn: sqlite3.Connection,
+    interview_id: int,
+    records: list[TranscriptRecord],
+    meta: InterviewMeta,
+    replacement_map: dict[str, str],
+) -> list[tuple[int, str, str]]:
+    """Записать записи транскрипта (L1) и вернуть их для сборки реплик."""
+    turns: list[tuple[int, str, str]] = []
+    for rec in records:
+        role = meta.roles[rec.speaker_label]
+        text = pseudonymize(rec.text, replacement_map)
+        turn_id_raw = conn.execute(
+            "INSERT INTO turn (interview_id, line_no, start_sec, speaker_role, text, pii_flag)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (interview_id, rec.line_no, rec.start_sec, role, text, int(detect_pii(text))),
+        ).lastrowid
+        if turn_id_raw is None:
+            msg = f"SQLite не вернул id вставленной строки turn (строка {rec.line_no})"
+            raise sqlite3.Error(msg)
+        turns.append((int(turn_id_raw), role, text))
+    return turns
+
+
+def _write_utterances(
+    conn: sqlite3.Connection,
+    interview_id: int,
+    turns: list[tuple[int, str, str]],
+    pipeline: PipelineSettings,
+) -> list[UtteranceDraft]:
+    """Собрать и записать реплики."""
+    drafts = build_utterances(turns, set(pipeline.backchannel_words), pipeline.backchannel_max_words)
+    for draft in drafts:
+        conn.execute(
+            "INSERT INTO utterance (interview_id, speaker_role, text, turn_ids, is_backchannel) VALUES (?, ?, ?, ?, ?)",
+            (interview_id, draft.speaker_role, draft.text, json.dumps(draft.turn_ids), int(draft.is_backchannel)),
+        )
+    return drafts
 
 
 def load_names_map(env_path: str) -> dict[str, str]:

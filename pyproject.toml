@@ -43,6 +43,6 @@ disallow_untyped_defs = true
 testpaths = ["tests"]
 markers = [
     "real_codebook: требует переменную окружения QA_REAL_CODEBOOK_PATH",
-    "real_transcript: требует переменные QA_REAL_TRANSCRIPT_PATH и QA_REAL_INTERVIEW_META",
+    "real_transcript: требует QA_REAL_TRANSCRIPT_PATH; метаданные — QA_REAL_INTERVIEW_META или QA_REAL_GROUP",
     "real_transcript_golden: требует QA_REAL_TRANSCRIPT_PATH и золотой набор оператора",
 ]

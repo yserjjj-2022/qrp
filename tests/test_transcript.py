@@ -186,6 +186,38 @@ class TestPseudonymize:
         assert detect_pii("счёт 40817810123456789012")
         assert not detect_pii("обычный текст без данных")
 
+    def test_empty_names_map_does_not_delete_text(self) -> None:
+        """Заготовка таблицы «имя -> код» с пустыми значениями не вырезает слова."""
+        meta = InterviewMeta(
+            interview_id="R01",
+            respondent_code="R01",
+            group="Не торгующие",
+            roles={"Респондент А": "RESPONDENT", "Интервьюер Б": "INTERVIEWER"},
+            names_to_codes={},
+            date=None,
+            transcript_source=None,
+        )
+        mapping = build_replacement_map(meta, {"Респондент А": "", "Интервьюер Б": "   "})
+
+        assert all(value.strip() for value in mapping.values())
+        out = pseudonymize("Респондент А: я подключил счёт", mapping)
+        assert out == "R01: я подключил счёт"
+
+    def test_empty_names_to_codes_entry_ignored(self) -> None:
+        """Пустой код в names_to_codes не перекрывает замену по роли."""
+        meta = InterviewMeta(
+            interview_id="R01",
+            respondent_code="R01",
+            group="Не торгующие",
+            roles={"Респондент А": "RESPONDENT"},
+            names_to_codes={"Респондент А": ""},
+            date=None,
+            transcript_source=None,
+        )
+        mapping = build_replacement_map(meta)
+
+        assert mapping["Респондент А"] == "R01"
+
 
 class TestBackchannel:
     """Вставки-подтверждения."""
@@ -333,10 +365,37 @@ class TestLoadTranscript:
 
     def test_unknown_label_raises(self, db: sqlite3.Connection, tmp_path: Path, meta_path: Path) -> None:
         path = tmp_path / "t2.txt"
-        path.write_text(_HEADER + "\n00:00:01\tНеизвестный X\tтекст", encoding="utf-8")
+        path.write_text(_HEADER + "\n00:00:01	Неизвестный X	текст", encoding="utf-8")
         meta = load_meta(meta_path)
         with pytest.raises(TranscriptMetaError, match="не описаны"):
             load_transcript(db, path, meta, {}, PipelineSettings())
+
+    def test_failure_rolls_back_partial_load(
+        self,
+        db: sqlite3.Connection,
+        transcript_path: Path,
+        meta,  # noqa: ANN001
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Обрыв посреди вставок не оставляет частично загруженное интервью."""
+        from qa.pipeline import load_transcript as module
+
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("обрыв")
+
+        monkeypatch.setattr(module, "_write_utterances", boom)
+        with pytest.raises(RuntimeError, match="обрыв"):
+            load_transcript(db, transcript_path, meta, build_replacement_map(meta), PipelineSettings())
+
+        assert db.execute("SELECT COUNT(*) FROM interview").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM turn").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM interview_speaker").fetchone()[0] == 0
+
+        # После сбоя повторная загрузка проходит и не видит «уже загружено».
+        monkeypatch.undo()
+        result = load_transcript(db, transcript_path, meta, build_replacement_map(meta), PipelineSettings())
+        assert result.skipped is False
+        assert result.n_turns == 8
 
     def test_utterance_text_matches_turns(self, db: sqlite3.Connection, transcript_path: Path, meta) -> None:  # noqa: ANN001
         """Критерий 5: текст не теряется при сборке."""
@@ -387,15 +446,13 @@ class TestLoadTranscript:
 
 @pytest.mark.real_transcript
 class TestRealTranscript:
-    """Тест на реальном транскрипте. Пропускается без env-переменных."""
+    """Тест на реальном транскрипте. Пропускается без env-переменной."""
 
     def test_218_records(self, db: sqlite3.Connection) -> None:
         tr_path = os.environ.get("QA_REAL_TRANSCRIPT_PATH")
-        meta_p = os.environ.get("QA_REAL_INTERVIEW_META")
-        if not tr_path or not meta_p:
-            pytest.skip("Не заданы QA_REAL_TRANSCRIPT_PATH / QA_REAL_INTERVIEW_META")
+        if not tr_path:
+            pytest.skip("Не задана QA_REAL_TRANSCRIPT_PATH")
         transcript = Path(tr_path)
-        meta = load_meta(Path(meta_p))
         if not transcript.exists():
             pytest.skip(f"Файл не найден: {transcript}")
 
@@ -405,6 +462,18 @@ class TestRealTranscript:
         assert len(labels) == 3, f"Ожидалось 3 метки, получено {len(labels)}"
         assert [r.start_sec for r in records] == sorted(r.start_sec for r in records)
 
+        # Метаданные: устаревший interview.yaml, если задан, иначе план init-interview.
+        meta_p = os.environ.get("QA_REAL_INTERVIEW_META")
+        if meta_p:
+            meta = load_meta(Path(meta_p))
+        else:
+            from qa.pipeline.init_interview import build_plan, plan_to_meta
+            from qa.settings import GroupsSettings
+
+            groups = GroupsSettings()
+            plan = build_plan(db, transcript, os.environ.get("QA_REAL_GROUP", "Не торгующие"), groups)
+            meta = plan_to_meta(plan)
+
         names_map: dict[str, str] = {}
         names_map_path = os.environ.get("NAMES_MAP_PATH")
         if names_map_path:
@@ -412,6 +481,9 @@ class TestRealTranscript:
 
             names_map = load_names_map(names_map_path)
         mapping = build_replacement_map(meta, names_map)
+        # Пустое значение в таблице «имя -> код» не должно вырезать слова из текста.
+        assert all(value.strip() for value in mapping.values()), "в карте замен есть пустые значения"
+
         result = load_transcript(db, transcript, meta, mapping, PipelineSettings())
         assert result.n_turns == 218
 
@@ -420,3 +492,9 @@ class TestRealTranscript:
             assert label not in all_text, f"Метка {label!r} осталась в тексте"
         for name in mapping:
             assert name not in all_text, f"Имя {name!r} осталось в тексте"
+
+        # Псевдонимизация не должна удалять слова: ни одна запись не стала пустой
+        # и не потеряла текст целиком (пустая замена в таблице «имя -> код»).
+        stored = [row[0] for row in db.execute("SELECT text FROM turn").fetchall()]
+        assert all(text.strip() for text in stored), "есть записи с пустым текстом после псевдонимизации"
+        assert len(stored) == len(records)
