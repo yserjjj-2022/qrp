@@ -6,11 +6,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
 from qa.pipeline.workbook import WorkbookData
+from qa.settings import GroupsSettings, resolve_group
+
+logger = logging.getLogger(__name__)
+
+
+def _group_value(value: Any, groups: GroupsSettings | None) -> Any:
+    """Каноническая группа; неизвестное значение сохраняется как есть с предупреждением."""
+    if value is None or groups is None:
+        return value
+    canonical, recognized = resolve_group(str(value), groups)
+    if not recognized:
+        logger.warning("Неизвестная группа %r: сохранена как есть", str(value))
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -63,8 +77,9 @@ class WorkbookRepository:
 class CodebookRepository:
     """Версии кодбука, коды, вопросы, атрибуты, связи вопрос-код."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, groups: GroupsSettings | None = None) -> None:
         self._conn = conn
+        self._groups = groups
 
     def find_by_codebook_hash(self, codebook_hash: str) -> int | None:
         """id версии кодбука по хешу кодбуковых листов."""
@@ -115,7 +130,7 @@ class CodebookRepository:
                 version_id,
                 row.get("question_id"),
                 row.get("block"),
-                row.get("group"),
+                _group_value(row.get("group"), self._groups),
                 row.get("wording"),
                 row.get("goal"),
                 row.get("notes"),
@@ -388,8 +403,9 @@ class ReferenceFactRepository:
 class InterviewRepository:
     """Интервью и говорящие."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, groups: GroupsSettings | None = None) -> None:
         self._conn = conn
+        self._groups = groups
 
     def find_by_external_id(self, interview_id: str) -> dict[str, Any] | None:
         """Интервью по внешнему идентификатору."""
@@ -412,7 +428,7 @@ class InterviewRepository:
         cursor = self._conn.execute(
             'INSERT INTO interview (id_external, name, respondent_code, "group", transcript_source, interview_date)'
             " VALUES (?, ?, ?, ?, ?, ?)",
-            (interview_id, name, respondent_code, group, transcript_source, interview_date),
+            (interview_id, name, respondent_code, _group_value(group, self._groups), transcript_source, interview_date),
         )
         new_id = cursor.lastrowid
         if new_id is None:
@@ -433,7 +449,14 @@ class InterviewRepository:
         self._conn.execute(
             'UPDATE interview SET name = ?, respondent_code = ?, "group" = ?, transcript_source = ?,'
             " interview_date = ? WHERE id = ?",
-            (name, respondent_code, group, transcript_source, interview_date, interview_db_id),
+            (
+                name,
+                respondent_code,
+                _group_value(group, self._groups),
+                transcript_source,
+                interview_date,
+                interview_db_id,
+            ),
         )
 
     def add_speaker(self, interview_db_id: int, label: str, role: str, words: int) -> None:

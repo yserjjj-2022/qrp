@@ -21,7 +21,7 @@ from qa.db.workbook_repo import (
     WorkbookRepository,
 )
 from qa.pipeline.workbook import WorkbookData, read_workbook
-from qa.settings import WorkbookSettings
+from qa.settings import GroupsSettings, WorkbookSettings, normalize_lexicon_status
 
 logger = logging.getLogger(__name__)
 
@@ -59,20 +59,30 @@ def _list(row: dict[str, Any], key: str) -> list[str]:
 def _load_lexicon(
     workbook: WorkbookData,
     repo: LexiconRepository,
+    status_map: dict[str, str],
     result: LoadProjectResult,
 ) -> None:
-    """Загрузить лексикон; расхождения с review-terms вывести в отчёт."""
+    """Загрузить лексикон; расхождения с review-terms вывести в отчёт.
+
+    Статус приводится к proposed/approved/rejected по lexicon_status_map;
+    неизвестное значение даёт предупреждение и 'proposed'.
+    """
     sheet = workbook.sheet(SHEET_LEXICON)
     if sheet is None:
         result.missing_sheets.append(SHEET_LEXICON)
         return
-    for row in sheet.rows:
+    for row, row_number in zip(sheet.rows, sheet.row_numbers, strict=True):
         canonical = _text(row, "canonical")
         if canonical is None:
             continue
         variants = _list(row, "variants")
         definition = _text(row, "definition")
-        status = _text(row, "status")
+        raw_status = _text(row, "status")
+        status, recognized = normalize_lexicon_status(raw_status, status_map)
+        if not recognized:
+            result.discrepancies.append(
+                f"Лексикон, строка {row_number}: неизвестный статус {raw_status!r} у '{canonical}', принят 'proposed'"
+            )
         applied = repo.upsert_from_workbook(canonical, variants, definition, status)
         if not applied:
             stored = repo.all_terms().get(canonical, {})
@@ -213,12 +223,19 @@ def load_project(
     conn: sqlite3.Connection,
     workbook_path: Path,
     workbook_settings: WorkbookSettings,
+    *,
+    groups: GroupsSettings | None = None,
+    lexicon_status_map: dict[str, str] | None = None,
 ) -> LoadProjectResult:
     """Загрузить необязательные листы проекта и умолчания.
 
+    Args:
+        groups: канонические значения групп; неизвестное сохраняется с предупреждением.
+        lexicon_status_map: приведение статусов лексикона к proposed/approved/rejected.
+
     Raises:
         FileNotFoundError: файл не найден.
-        WorkbookError: отсутствует обязательный лист/колонка или версия книги не загружена.
+        WorkbookError: нет обязательного листа/колонки или книга не загружена.
     """
     workbook = read_workbook(workbook_path, workbook_settings)
     workbook_repo = WorkbookRepository(conn)
@@ -228,9 +245,9 @@ def load_project(
         raise RuntimeError(msg)
 
     result = LoadProjectResult(workbook_version_id=workbook_version_id)
-    _load_lexicon(workbook, LexiconRepository(conn), result)
+    _load_lexicon(workbook, LexiconRepository(conn), lexicon_status_map or {}, result)
     _load_markers(workbook, MarkerRepository(conn), workbook_settings, result)
-    interviews = InterviewRepository(conn)
+    interviews = InterviewRepository(conn, groups)
     _load_interviews(workbook, interviews, interviews, result)
     _load_golden(workbook, GoldenRepository(conn), result)
     _load_facts(workbook, workbook_version_id, ReferenceFactRepository(conn), workbook_settings, result)

@@ -49,6 +49,76 @@ class M1bSettings(BaseModel):
     review_sample_share: float = Field(default=0.10, ge=0, le=1)
 
 
+class GroupsSettings(BaseModel):
+    """Канонические значения групп и их алиасы.
+
+    Сравнение идёт по casefold: «ТОРГ», «торг», «Торгующие» дают одно значение.
+    """
+
+    canonical: list[str] = Field(default_factory=lambda: ["Все", "ТОРГ", "Не торгующие"])
+    aliases: dict[str, list[str]] = Field(default_factory=dict)
+
+    def lookup(self) -> dict[str, str]:
+        """Карта «нормализованный алиас -> каноническое значение»."""
+        table: dict[str, str] = {}
+        for canonical in self.canonical:
+            key = _normalize_key(canonical)
+            self._put(table, key, canonical)
+            for alias in self.aliases.get(canonical, []):
+                self._put(table, _normalize_key(alias), canonical)
+        return table
+
+    @staticmethod
+    def _put(table: dict[str, str], key: str, canonical: str) -> None:
+        """Записать алиас; конфликт двух канонических значений — ошибка конфига."""
+        existing = table.get(key)
+        if existing is not None and existing != canonical:
+            msg = f"Алиас группы {key!r} указан и для {existing!r}, и для {canonical!r}"
+            raise ValueError(msg)
+        table[key] = canonical
+
+
+def _normalize_key(value: str) -> str:
+    """Ключ сравнения: strip + casefold + схлопывание пробелов и подчёркиваний."""
+    text = " ".join(value.replace("_", " ").split())
+    return text.casefold()
+
+
+def normalize_group(value: str, groups: GroupsSettings | None = None) -> str:
+    """Привести группу к каноническому значению.
+
+    Неизвестное значение не ошибка: возвращается как есть (после strip),
+    вызывающая сторона выводит предупреждение.
+    """
+    settings = groups or GroupsSettings()
+    canonical, _recognized = resolve_group(value, settings)
+    return canonical
+
+
+def resolve_group(value: str, groups: GroupsSettings) -> tuple[str, bool]:
+    """Каноническая группа и признак «значение распознано»."""
+    canonical = groups.lookup().get(_normalize_key(value))
+    return (canonical, True) if canonical is not None else (value.strip(), False)
+
+
+def normalize_lexicon_status(value: str | None, aliases: dict[str, str]) -> tuple[str, bool]:
+    """Привести статус лексикона к proposed/approved/rejected.
+
+    Returns:
+        (статус, распознан ли). Неизвестное значение даёт 'proposed' и False.
+    """
+    text = (value or "").strip()
+    if not text:
+        return "proposed", True
+    key = _normalize_key(text)
+    for source, target in aliases.items():
+        if _normalize_key(source) == key:
+            return target, True
+    if key in ("proposed", "approved", "rejected"):
+        return key, True
+    return "proposed", False
+
+
 class PathsSettings(BaseModel):
     """Пути проекта. Все значения относительны корня репозитория."""
 
@@ -123,6 +193,8 @@ class Settings(BaseModel):
     pipeline: PipelineSettings = PipelineSettings()
     m1b: M1bSettings = M1bSettings()
     workbook: WorkbookSettings = WorkbookSettings()
+    groups: GroupsSettings = GroupsSettings()
+    lexicon_status_map: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

@@ -25,12 +25,11 @@ from qa.pipeline.load_transcript import (
     propose_roles,
     respondent_code_from_filename,
 )
+from qa.settings import GroupsSettings, resolve_group
 
 logger = logging.getLogger(__name__)
 
-GROUP_TRADING = "ТОРГ"
-GROUP_NON_TRADING = "не торгующие"
-ALLOWED_GROUPS = (GROUP_TRADING, GROUP_NON_TRADING)
+DEFAULT_GROUP = "Не торгующие"
 
 
 @dataclass
@@ -44,6 +43,7 @@ class InterviewPlan:
     header: str
     word_counts: dict[str, int]
     roles: dict[str, str]
+    field_notes: list[str] = field(default_factory=list)
     from_workbook: bool = False
     from_db: bool = False
     existing: bool = False
@@ -55,26 +55,19 @@ class InterviewPlan:
         return not self.from_workbook
 
 
-def normalize_group(value: str) -> str:
-    """Привести группу к допустимому значению.
-
-    Raises:
-        TranscriptMetaError: группа вне списка.
-    """
-    text = value.strip()
-    lowered = text.lower()
-    if lowered in (GROUP_TRADING.lower(), "торг", "торгующие"):
-        return GROUP_TRADING
-    if lowered in (GROUP_NON_TRADING.lower(), "не_торгующие", "не торг", "нет"):
-        return GROUP_NON_TRADING
-    msg = f"Недопустимая группа {value!r}. Допустимы: {GROUP_TRADING!r}, {GROUP_NON_TRADING!r}"
-    raise TranscriptMetaError(msg)
+def normalize_group(value: str, groups: GroupsSettings | None = None) -> str:
+    """Каноническое значение группы; неизвестное возвращается как есть."""
+    canonical, recognized = resolve_group(value, groups or GroupsSettings())
+    if not recognized:
+        logger.warning("Неизвестная группа %r сохранена как есть", value)
+    return canonical
 
 
 def build_plan(
     conn: sqlite3.Connection,
     transcript_path: Path,
     group: str | None,
+    groups: GroupsSettings | None = None,
 ) -> InterviewPlan:
     """Составить план интервью: код из имени файла, дата из заголовка, роли по словам.
 
@@ -84,18 +77,19 @@ def build_plan(
     header, records = parse_transcript(transcript_path)
     respondent_code = respondent_code_from_filename(transcript_path)
     header_date = parse_header_date(header)
+    groups = groups or GroupsSettings()
 
-    repo = InterviewRepository(conn)
+    repo = InterviewRepository(conn, groups)
     stored = repo.find_by_external_id(respondent_code)
+    missing_group_msg = "Не задана группа респондента. Укажите --group (значения и алиасы заданы в config.yaml, groups)"
     if stored is None:
         if group is None:
-            msg = 'Не задана группа респондента. Укажите --group ТОРГ или --group "не торгующие"'
-            raise TranscriptMetaError(msg)
+            raise TranscriptMetaError(missing_group_msg)
         word_counts = count_speaker_words(records)
         return InterviewPlan(
             interview_id=respondent_code,
             respondent_code=respondent_code,
-            group=normalize_group(group),
+            group=normalize_group(group, groups),
             interview_date=header_date,
             header=header,
             word_counts=word_counts,
@@ -105,11 +99,18 @@ def build_plan(
     stored_speakers = repo.speakers(respondent_code)
     stored_date = str(stored["interview_date"]) if stored["interview_date"] else None
     stored_group = str(stored["group"]) if stored["group"] else None
+    if group is not None:
+        resolved_group = normalize_group(group, groups)
+    elif stored_group is not None:
+        resolved_group = normalize_group(stored_group, groups)
+    else:
+        raise TranscriptMetaError(missing_group_msg)
+
     if stored_speakers:
         return InterviewPlan(
             interview_id=respondent_code,
             respondent_code=str(stored["respondent_code"] or respondent_code),
-            group=str(group and normalize_group(group) or stored["group"] or GROUP_NON_TRADING),
+            group=resolved_group,
             interview_date=stored_date or header_date,
             header=str(stored["name"] or header),
             word_counts={label: words for label, _role, words in stored_speakers},
@@ -120,15 +121,12 @@ def build_plan(
             notes=["Роли взяты из БД (лист «Интервью» или прошлый init-interview); повторно не спрашиваются"],
         )
 
-    if group is None and stored_group is None:
-        msg = 'Не задана группа респондента. Укажите --group ТОРГ или --group "не торгующие"'
-        raise TranscriptMetaError(msg)
     word_counts = count_speaker_words(records)
     stored_code = str(stored["respondent_code"] or respondent_code)
     return InterviewPlan(
         interview_id=respondent_code,
         respondent_code=stored_code,
-        group=normalize_group(group) if group is not None else str(stored_group),
+        group=resolved_group,
         interview_date=header_date or stored_date,
         header=str(stored["name"] or header),
         word_counts=word_counts,
@@ -139,9 +137,13 @@ def build_plan(
     )
 
 
-def apply_plan(conn: sqlite3.Connection, plan: InterviewPlan) -> int:
+def apply_plan(
+    conn: sqlite3.Connection,
+    plan: InterviewPlan,
+    groups: GroupsSettings | None = None,
+) -> int:
     """Записать интервью и роли в БД (идемпотентно). Возвращает id интервью."""
-    repo = InterviewRepository(conn)
+    repo = InterviewRepository(conn, groups)
     existing = repo.find_by_external_id(plan.interview_id)
     if existing is None:
         interview_db_id = repo.create(

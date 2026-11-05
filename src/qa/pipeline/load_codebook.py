@@ -18,7 +18,7 @@ from typing import Any
 
 from qa.db.workbook_repo import CodebookRepository, ThemeRepository, WorkbookRepository
 from qa.pipeline.workbook import SheetData, WorkbookData, WorkbookError, is_identifier_like, read_workbook
-from qa.settings import WorkbookSettings
+from qa.settings import GroupsSettings, WorkbookSettings
 
 logger = logging.getLogger(__name__)
 
@@ -138,23 +138,37 @@ def _build_tree_from_themes(
     theme_rows: list[dict[str, Any]],
     code_ids: dict[str, int],
     themes: ThemeRepository,
-) -> None:
-    """Собрать дерево из листа «Темы»: узел -> тема -> коды."""
+) -> list[str]:
+    """Собрать дерево из листа «Темы»: узел -> тема -> коды.
+
+    Пустая тема и тема без кодов — заметки, а не ошибка: дерево достраивается
+    оператором, а загрузка кодбука не должна останавливаться.
+    """
+    notes: list[str] = []
     nodes: dict[str, int] = {}
     for row in theme_rows:
         node_name = _text(row, "node")
         theme_name = _text(row, "theme")
-        if node_name is None or theme_name is None:
+        if node_name is None:
+            notes.append("Лист 'Темы': строка без узла пропущена")
             continue
         node_id = nodes.get(node_name)
         if node_id is None:
             node_id = themes.insert_node(node_name)
             nodes[node_name] = node_id
+        if theme_name is None:
+            notes.append(f"Лист 'Темы': узел '{node_name}' без темы — узел создан пустым")
+            continue
         theme_id = themes.insert_theme(theme_name, node_id)
+        bound = 0
         for code in _identifiers(row, "codes"):
             code_id = code_ids.get(code)
             if code_id is not None:
                 themes.bind(theme_id, code_id)
+                bound += 1
+        if bound == 0:
+            notes.append(f"Лист 'Темы': тема '{theme_name}' (узел '{node_name}') без кодов")
+    return notes
 
 
 def _build_tree_from_families(
@@ -238,6 +252,7 @@ def load_codebook(
     workbook_settings: WorkbookSettings,
     *,
     reload: bool = False,
+    groups: GroupsSettings | None = None,
 ) -> LoadCodebookResult:
     """Загрузить обязательные листы книги, темы и словарь замен.
 
@@ -246,6 +261,7 @@ def load_codebook(
         workbook_path: путь к .xlsx.
         workbook_settings: классы листов и схемы колонок из config.yaml.
         reload: пересобрать темы, даже если версия уже загружена.
+        groups: канонические значения групп для нормализации листа «Вопросы_и_коды».
 
     Raises:
         FileNotFoundError: файл не найден.
@@ -258,7 +274,7 @@ def load_codebook(
             logger.warning(warning)
 
     workbook_repo = WorkbookRepository(conn)
-    codebook_repo = CodebookRepository(conn)
+    codebook_repo = CodebookRepository(conn, groups)
     themes_repo = ThemeRepository(conn)
 
     existing_workbook = workbook_repo.find_by_hash(workbook.file_hash)
@@ -301,12 +317,12 @@ def load_codebook(
     themes_repo.clear()
     notes: list[str] = []
     if theme_rows:
-        _build_tree_from_themes(theme_rows, code_ids, themes_repo)
+        notes.extend(_build_tree_from_themes(theme_rows, code_ids, themes_repo))
     else:
         unknown = _build_tree_from_families(code_rows, code_ids, workbook_settings.family_nodes, themes_repo)
         notes = [f"Семья без маппинга в узел: {family}" for family in unknown]
-        for note in notes:
-            logger.warning(note)
+    for note in notes:
+        logger.warning(note)
 
     conn.commit()
     counts = codebook_repo.counts(codebook_version_id)

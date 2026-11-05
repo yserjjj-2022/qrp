@@ -19,8 +19,10 @@ from qa.pipeline.init_interview import (
     render_plan,
 )
 from qa.pipeline.load_transcript import TranscriptMetaError, load_names_map
+from qa.settings import Settings
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_GROUPS = Settings.load(_PROJECT_ROOT / "config.yaml").groups
 _MIGRATIONS_DIR = _PROJECT_ROOT / "migrations"
 
 _TRANSCRIPT = "\n".join(
@@ -57,7 +59,7 @@ class TestBuildPlan:
         plan = build_plan(db, transcript, "не торгующие")
         assert plan.interview_id == "R01"
         assert plan.respondent_code == "R01"
-        assert plan.group == "не торгующие"
+        assert plan.group == "Не торгующие"
         assert plan.interview_date == "2026-11-02"
         # Больше слов у респондента, второй по словам — интервьюер
         assert plan.roles["Петров П.П."] == "RESPONDENT"
@@ -88,7 +90,7 @@ class TestBuildPlan:
         )
         db.commit()
         plan = build_plan(db, transcript, None)
-        assert plan.group == "не торгующие"
+        assert plan.group == "Не торгующие"
         assert plan.interview_date == "2026-11-02"
         assert plan.existing is True
         # Роли ещё не подтверждены — спросить оператора
@@ -144,23 +146,38 @@ class TestApplyPlan:
 
 
 class TestGroup:
-    """Нормализация группы."""
+    """Нормализация группы по config.yaml."""
 
     @pytest.mark.parametrize(
         ("value", "expected"),
         [
             ("ТОРГ", "ТОРГ"),
             ("торг", "ТОРГ"),
-            ("не торгующие", "не торгующие"),
-            ("не_торгующие", "не торгующие"),
+            ("Торгующие", "ТОРГ"),
+            ("Не торгующие", "Не торгующие"),
+            ("не торгующие", "Не торгующие"),
+            ("не_торгующие", "Не торгующие"),
+            ("  Не Торгующие  ", "Не торгующие"),
+            ("Все", "Все"),
+            ("все", "Все"),
         ],
     )
     def test_normalize(self, value: str, expected: str) -> None:
-        assert normalize_group(value) == expected
+        assert normalize_group(value, _GROUPS) == expected
 
-    def test_unknown_raises(self) -> None:
-        with pytest.raises(TranscriptMetaError, match="Недопустимая группа"):
-            normalize_group("смешанная")
+    def test_case_insensitive_same_value(self) -> None:
+        assert normalize_group("не торгующие", _GROUPS) == normalize_group("Не торгующие", _GROUPS)
+
+    def test_unknown_kept_as_is(self) -> None:
+        """Неизвестное значение сохраняется как есть, без исключения."""
+        assert normalize_group("  смешанная  ", _GROUPS) == "смешанная"
+
+    def test_config_missing_alias_raises(self) -> None:
+        """Один алиас у двух канонических значений — ошибка конфига."""
+        from qa.settings import GroupsSettings
+
+        with pytest.raises(ValueError, match="Алиас группы"):
+            GroupsSettings(canonical=["ТОРГ", "Все"], aliases={"ТОРГ": ["все"]}).lookup()
 
 
 class TestNamesMap:

@@ -25,6 +25,8 @@ CellValue = str | int | list[str] | None
 
 # Разделители элементов списка в ячейках: «8, 9, 12Т», «R1; R2», «R1–R8».
 _LIST_SPLIT_RE = re.compile(r"[;,\n]+")
+# Пометки «пусто» в ячейках списка: считаются отсутствием значений, а не ошибкой.
+_EMPTY_MARKERS = frozenset({"—", "–", "-"})
 # Диапазон: R1–R8, E0–E7, A1–A8, N1–N4, C1–C4 (дефис, минус, en dash, em dash).
 _RANGE_RE = re.compile(r"^([A-Za-zА-Яа-яЁё]+)(\d+)\s*[-–—]\s*([A-Za-zА-Яа-яЁё]+)(\d+)$")
 # Свободный текст, который не является идентификатором: «индуктивно», «все вопросы».
@@ -116,7 +118,7 @@ def parse_list(value: Any) -> list[str]:
     items: list[str] = []
     for chunk in _split_top_level(text):
         part = chunk.strip()
-        if not part:
+        if not part or part in _EMPTY_MARKERS:
             continue
         items.extend(_expand_item(part))
     return items
@@ -263,7 +265,11 @@ class _SheetReader:
         return _convert_cell(self._ws.title, column, raw, row_number)
 
     def _collect_notes(self, row_number: int, record: dict[str, Any]) -> str | None:
-        """Заметка о нераспознанных элементах списков."""
+        """Заметка о нераспознанных элементах списков.
+
+        Raises:
+            WorkbookError: в строгой колонке элемент не является идентификатором.
+        """
         unknown_parts: list[str] = []
         for field_name, column in self._spec.columns.items():
             if column.type != "list":
@@ -272,8 +278,15 @@ class _SheetReader:
             if not isinstance(value, list):
                 continue
             unknown = [item for item in value if not is_identifier_like(item)]
-            if unknown and not column.strict:
-                unknown_parts.append(f"{column.header}: {', '.join(unknown)}")
+            if not unknown:
+                continue
+            if column.strict:
+                msg = (
+                    f"Лист '{self._ws.title}', строка {row_number}, колонка '{column.header}': "
+                    f"нераспознанные значения {unknown} (ожидались коды или вопросы)"
+                )
+                raise WorkbookError(msg)
+            unknown_parts.append(f"{column.header}: {', '.join(unknown)}")
         if not unknown_parts:
             return None
         return f"Лист '{self._ws.title}', строка {row_number}: нераспознано — {'; '.join(unknown_parts)}"

@@ -63,6 +63,13 @@ class TestParseList:
         assert parse_list(None) == []
         assert parse_list("   ") == []
 
+    def test_empty_markers(self) -> None:
+        """Пометки «пусто» в ячейках списков не являются значениями."""
+        assert parse_list("—") == []
+        assert parse_list("–") == []
+        assert parse_list("-") == []
+        assert parse_list("R1; —") == ["R1"]
+
     def test_broken_range_kept_as_is(self) -> None:
         assert parse_list("R8–R1") == ["R8–R1"]
 

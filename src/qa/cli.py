@@ -60,7 +60,13 @@ def cmd_load_codebook(args: argparse.Namespace) -> int:
 
     conn = _open_db(settings)
     try:
-        result = load_codebook(conn, _workbook_path(args, settings), settings.workbook, reload=args.reload)
+        result = load_codebook(
+            conn,
+            _workbook_path(args, settings),
+            settings.workbook,
+            reload=args.reload,
+            groups=settings.groups,
+        )
     finally:
         conn.close()
     if not result.created:
@@ -84,7 +90,13 @@ def cmd_load_project(args: argparse.Namespace) -> int:
 
     conn = _open_db(settings)
     try:
-        result = load_project(conn, _workbook_path(args, settings), settings.workbook)
+        result = load_project(
+            conn,
+            _workbook_path(args, settings),
+            settings.workbook,
+            groups=settings.groups,
+            lexicon_status_map=settings.lexicon_status_map,
+        )
     finally:
         conn.close()
     print(f"[{run_id}] проект: {result.counts}")
@@ -102,14 +114,14 @@ def cmd_init_interview(args: argparse.Namespace) -> int:
 
     conn = _open_db(settings)
     try:
-        plan = build_plan(conn, Path(args.transcript), args.group)
+        plan = build_plan(conn, Path(args.transcript), args.group, settings.groups)
         print(render_plan(plan))
         if plan.needs_confirmation:
             answer = input("Записать роли в БД? [y/N]: ").strip().lower()
             if answer not in ("y", "н", "да"):
                 print("Отменено оператором, в БД ничего не записано")
                 return 1
-        interview_db_id = apply_plan(conn, plan)
+        interview_db_id = apply_plan(conn, plan, settings.groups)
         names_map_path = create_names_map_skeleton(plan)
     finally:
         conn.close()
@@ -134,7 +146,7 @@ def cmd_load_transcript(args: argparse.Namespace) -> int:
         if args.meta:
             meta = load_meta(Path(args.meta))
         else:
-            plan = build_plan(conn, transcript_path, args.group)
+            plan = build_plan(conn, transcript_path, args.group, settings.groups)
             if args.interview_id and args.interview_id != plan.interview_id:
                 print(
                     f"Интервью {args.interview_id} не совпадает с кодом из имени файла ({plan.interview_id}). "
@@ -225,13 +237,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = subparsers.add_parser("init-interview", help="Определить роли и записать интервью")
     p_init.add_argument("transcript", help="Путь к транскрипту (.txt, UTF-8), имя файла = код респондента")
-    p_init.add_argument("--group", help="ТОРГ или «не торгующие»")
+    p_init.add_argument("--group", help="Группа респондента; значения и алиасы заданы в config.yaml (groups)")
     p_init.set_defaults(func=cmd_init_interview)
 
     p_tr = subparsers.add_parser("load-transcript", help="Загрузить транскрипт интервью (M1a)")
     p_tr.add_argument("transcript", help="Путь к транскрипту (.txt, UTF-8)")
     p_tr.add_argument("--interview-id", help="id_интервью из БД или листа «Интервью»")
-    p_tr.add_argument("--group", help="ТОРГ или «не торгующие», если интервью ещё нет в БД")
+    p_tr.add_argument("--group", help="Группа респондента, если интервью ещё нет в БД (значения из config.yaml)")
     p_tr.add_argument("--meta", help="Устаревший interview.yaml (совместимость)")
     p_tr.set_defaults(func=cmd_load_transcript)
 
