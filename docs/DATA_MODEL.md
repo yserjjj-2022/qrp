@@ -1,6 +1,8 @@
 # DATA_MODEL: схема базы данных
 
-Все поля и связи фиксируются в миграции `migrations/0001_create_tables.sql`.
+Все поля и связи фиксируются миграциями в `migrations/`:
+`0001_create_tables.sql` (каркас), `0002_transcript_turns.sql` (записи и реплики),
+`0003_workbook.sql` (рабочая книга, кодбук, лексикон, золотой набор, факты).
 
 ## Таблицы
 
@@ -15,6 +17,7 @@
 | respondent_code | TEXT | Код респондента (R01...) — миграция 0002 |
 | group | TEXT | Группа (ТОРГ / не торгующие) — миграция 0002 |
 | transcript_source | TEXT | Источник/тип расшифровки — миграция 0002 |
+| interview_date | TEXT | Дата интервью из заголовка или листа «Интервью» — миграция 0003 |
 | created_at | TIMESTAMP | Дата создания |
 
 ### turn
@@ -62,6 +65,8 @@
 | id | INTEGER PRIMARY KEY | Автоинкремент |
 | file_hash | TEXT NOT NULL | SHA-256 Excel-файла |
 | extensions_hash | TEXT | Хеш расширений кодбука |
+| workbook_version_id | INTEGER | Ссылка на версию рабочей книги — миграция 0003 |
+| codebook_hash | TEXT | Хеш только кодбуковых листов, уникален — миграция 0003 |
 | created_at | TIMESTAMP | Дата создания |
 
 ### code
@@ -73,9 +78,12 @@
 | codebook_version_id | INTEGER NOT NULL | Ссылка на версию |
 | family | TEXT | Семейство кодов |
 | name | TEXT NOT NULL | Идентификатор кода |
+| kind | TEXT | Тип кода из листа «Коды» — миграция 0003 |
+| title | TEXT | Название кода — миграция 0003 |
 | definition | TEXT | Определение |
 | include | TEXT | Что включаем |
 | exclude | TEXT | Что исключаем |
+| tiebreak_rule | TEXT | Правило при сомнении — миграция 0003 |
 | tiebreak | INTEGER | Приоритет при конфликте |
 | applies_to | TEXT | К чему применяется |
 | origin | TEXT NOT NULL | base или inductive |
@@ -100,6 +108,11 @@
 | id | INTEGER PRIMARY KEY | Автоинкремент |
 | codebook_version_id | INTEGER NOT NULL | Ссылка на версию |
 | identifier | TEXT NOT NULL | Идентификатор (1, 7Т, 14Т-б) |
+| block | TEXT | Блок гайда — миграция 0003 |
+| group | TEXT | Группа (Все / ТОРГ) — миграция 0003 |
+| wording | TEXT | Формулировка вопроса — миграция 0003 |
+| goal | TEXT | Что хотим понять — миграция 0003 |
+| notes | TEXT | Заметки — миграция 0003 |
 
 ### annotation
 Разметка фрагмента.
@@ -194,3 +207,139 @@
 | reason | TEXT | Обоснование |
 | status | TEXT NOT NULL | pending, approved, rejected |
 | run_id | INTEGER | Ссылка на прогон |
+
+## Рабочая книга (миграция 0003)
+
+### workbook_version
+Прочитанная версия рабочей книги проекта.
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| workbook_path | TEXT NOT NULL | Путь к файлу книги |
+| file_hash | TEXT NOT NULL UNIQUE | SHA-256 файла |
+| codebook_hash | TEXT NOT NULL | Хеш кодбуковых листов |
+| loaded_at | TIMESTAMP | Когда загружена |
+
+### workbook_sheet
+Хеши листов в составе версии книги.
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| workbook_version_id | INTEGER NOT NULL | Ссылка на версию книги |
+| sheet_name | TEXT NOT NULL | Имя листа |
+| header_hash | TEXT NOT NULL | Хеш заголовка |
+| content_hash | TEXT NOT NULL | Хеш содержимого |
+| n_rows | INTEGER NOT NULL DEFAULT 0 | Число строк |
+| UNIQUE(workbook_version_id, sheet_name) | | |
+
+### question_code
+Связь «вопрос -> код» из листов «Вопросы_и_коды» и «Коды».
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| question_id | INTEGER NOT NULL | Ссылка на question |
+| code_id | INTEGER NOT NULL | Ссылка на code |
+| UNIQUE(question_id, code_id) | | |
+
+### attribute_definition
+Описание атрибута разметки из листа «Атрибуты».
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| codebook_version_id | INTEGER NOT NULL | Ссылка на версию |
+| name | TEXT NOT NULL | Имя поля |
+| kind | TEXT | Тип (атрибут / оценка) |
+| description | TEXT | Описание значений |
+| UNIQUE(codebook_version_id, name) | | |
+
+### glossary_term
+Словарь замен для интервьюера (лист «Словарь_замен»).
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| codebook_version_id | INTEGER NOT NULL | Ссылка на версию |
+| term | TEXT NOT NULL | Не говорить |
+| replacement | TEXT | Говорить |
+| UNIQUE(codebook_version_id, term) | | |
+
+### lexicon
+Лексикон терминов: лист «Лексикон» плюс решения review-terms.
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| canonical | TEXT NOT NULL UNIQUE | Каноническая форма |
+| variants_json | TEXT NOT NULL DEFAULT '[]' | Варианты ASR (JSON) |
+| definition | TEXT | Определение |
+| status | TEXT NOT NULL DEFAULT 'proposed' | proposed / approved / rejected |
+| source | TEXT NOT NULL DEFAULT 'workbook' | workbook или review (review приоритетнее) |
+| updated_at | TIMESTAMP | Обновлено |
+
+### uncertainty_marker
+Маркеры неуверенности (лист «Маркеры_неуверенности» или умолчания config.yaml).
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| expression | TEXT NOT NULL UNIQUE | Выражение |
+| note | TEXT | Примечание |
+| source | TEXT NOT NULL DEFAULT 'workbook' | workbook или default |
+
+### golden_sample
+Золотой набор: реплики L1 и ручной L2 (лист «Золотой_набор» или xlsx экспорта).
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| interview_code | TEXT | Код интервью |
+| utterance_ref | TEXT | Ссылка вида utterance:<id> |
+| text_l1 | TEXT NOT NULL | Текст L1 |
+| text_l2_manual | TEXT | Ручной L2 |
+| source | TEXT NOT NULL DEFAULT 'workbook' | workbook / import |
+| created_at | TIMESTAMP | |
+| UNIQUE(interview_code, utterance_ref, text_l1) | | |
+
+### reference_fact
+Эталонные факты из листов с префиксом «Факты_».
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| workbook_version_id | INTEGER NOT NULL | Ссылка на версию книги |
+| sheet_name | TEXT NOT NULL | Имя листа |
+| external_id | TEXT NOT NULL | Идентификатор факта |
+| question | TEXT | Вопрос сверки |
+| answer | TEXT | Ответ |
+| comment | TEXT | Комментарий |
+| status | TEXT | Статус |
+| UNIQUE(workbook_version_id, sheet_name, external_id) | | |
+
+### interview_speaker
+Говорящие интервью: метки, роли и число слов (init-interview).
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| interview_id | INTEGER NOT NULL | Ссылка на interview |
+| speaker_label | TEXT NOT NULL | Метка из транскрипта |
+| role | TEXT NOT NULL | INTERVIEWER / RESPONDENT / OBSERVER |
+| words | INTEGER NOT NULL DEFAULT 0 | Число слов |
+| UNIQUE(interview_id, speaker_label) | | |
+
+### new_term
+Кандидаты новых терминов для review-terms (используется в M1b).
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| interview_id | INTEGER | Ссылка на interview |
+| surface_form | TEXT NOT NULL | Как встретилось в тексте |
+| context_utterance_id | INTEGER | Ссылка на utterance |
+| status | TEXT NOT NULL DEFAULT 'proposed' | proposed / approved / rejected |
+| created_at | TIMESTAMP | |
+| UNIQUE(surface_form, context_utterance_id) | | |
