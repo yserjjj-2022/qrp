@@ -49,7 +49,7 @@ class TestCLI:
             main()
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
-        assert "file" in captured.out
+        assert "workbook" in captured.out
 
 
 class TestSettings:
@@ -59,7 +59,28 @@ class TestSettings:
         assert settings.llm.provider == "stub"
 
     def test_db_path(self, settings: Settings) -> None:
-        assert settings.db_path.endswith("data/interviews.db")
+        assert settings.db_path.endswith("data/db/interviews.db")
+
+    def test_paths_defaults(self, settings: Settings) -> None:
+        assert settings.paths.workbook == "data/inputs/Rabochaya_kniga_proekta_v4.xlsx"
+        assert settings.paths.transcripts == "data/inputs/transcripts"
+        assert settings.paths.golden == "data/golden"
+
+    def test_workbook_sheet_classes(self, settings: Settings) -> None:
+        workbook = settings.workbook
+        assert workbook.sheet_class("Вопросы_и_коды") == "required"
+        assert workbook.sheet_class("Лексикон") == "optional"
+        assert workbook.sheet_class("Факты_Финам") == "optional"
+        assert workbook.sheet_class("Справка") == "ignored"
+        assert settings.workbook.sheet_class("_Служебный") == "ignored"
+        assert workbook.sheet_class("Что_то_новое") == "unknown"
+
+    def test_workbook_column_types(self, settings: Settings) -> None:
+        spec = settings.workbook.sheets["Коды"]
+        assert spec.columns["code"].type == "str"
+        assert spec.columns["questions"].type == "list"
+        assert spec.columns["questions"].list_kind == "question"
+        assert settings.workbook.sheets["Вопросы_и_коды"].columns["codes"].list_kind == "code"
 
     def test_llm_model_none(self, settings: Settings) -> None:
         assert settings.llm.model is None

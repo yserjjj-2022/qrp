@@ -12,16 +12,22 @@ import yaml
 from qa.db.connection import get_connection
 from qa.db.migrations import migrate
 from qa.pipeline.load_transcript import (
+    InterviewMeta,
     TranscriptMetaError,
     TranscriptParseError,
     build_replacement_map,
     build_utterances,
+    count_speaker_words,
     detect_pii,
     is_backchannel,
     load_meta,
+    load_names_map,
     load_transcript,
+    parse_header_date,
     parse_transcript,
+    propose_roles,
     pseudonymize,
+    respondent_code_from_filename,
 )
 from qa.settings import PipelineSettings
 
@@ -66,6 +72,19 @@ def db(tmp_path: Path) -> sqlite3.Connection:
     migrate(conn, db_path, _MIGRATIONS_DIR, tmp_path / "backups")
     yield conn
     conn.close()
+
+
+def _make_meta() -> InterviewMeta:
+    """Метаданные интервью из словаря _META."""
+    return InterviewMeta(
+        interview_id=str(_META["interview_id"]),
+        respondent_code=str(_META["respondent_code"]),
+        group=str(_META["group"]),
+        roles=dict(_META["roles"]),
+        names_to_codes=dict(_META["names_to_codes"]),
+        date=str(_META["date"]),
+        transcript_source=str(_META["transcript_source"]),
+    )
 
 
 @pytest.fixture()
@@ -237,6 +256,47 @@ class TestAssembly:
         assert drafts[1].is_backchannel is True
 
 
+class TestMetaHelpers:
+    """Код из имени файла, дата из заголовка, роли по числу слов."""
+
+    @pytest.mark.parametrize(
+        ("header", "expected"),
+        [
+            ("Интервью R01, 2026-10-01", "2026-10-01"),
+            ("Интервью, 01.10.2026", "2026-10-01"),
+            ("Интервью без даты", None),
+        ],
+    )
+    def test_parse_header_date(self, header: str, expected: str | None) -> None:
+        assert parse_header_date(header) == expected
+
+    def test_parse_header_date_invalid(self) -> None:
+        with pytest.raises(TranscriptMetaError, match="Некорректная дата"):
+            parse_header_date("Интервью, 2026-13-45")
+
+    def test_respondent_code_from_filename(self, tmp_path: Path) -> None:
+        assert respondent_code_from_filename(tmp_path / "R01.txt") == "R01"
+        with pytest.raises(TranscriptMetaError, match="R01"):
+            respondent_code_from_filename(tmp_path / "интервью.txt")
+
+    def test_propose_roles_by_words(self, transcript_path: Path) -> None:
+        _header, records = parse_transcript(transcript_path)
+        counts = count_speaker_words(records)
+        roles = propose_roles(counts)
+        assert roles["Петров П.П."] == "RESPONDENT"
+        assert roles["Иванов И.И."] == "INTERVIEWER"
+        assert roles["Сидорова А.А."] == "OBSERVER"
+        # Порядок первого появления сохраняется
+        assert list(counts) == ["Иванов И.И.", "Петров П.П.", "Сидорова А.А."]
+
+    def test_load_names_map(self, tmp_path: Path) -> None:
+        path = tmp_path / "names.yaml"
+        path.write_text("Петров: R02\n", encoding="utf-8")
+        assert load_names_map(str(path)) == {"Петров": "R02"}
+        with pytest.raises(FileNotFoundError):
+            load_names_map(str(tmp_path / "нет.yaml"))
+
+
 class TestLoadTranscript:
     """Сквозная загрузка интервью в БД."""
 
@@ -298,6 +358,31 @@ class TestLoadTranscript:
             "SELECT respondent_code, \"group\", transcript_source FROM interview WHERE id_external = 'IV01'"
         ).fetchone()
         assert row == ("R01", "ТОРГ", "machine ASR")
+
+    def test_header_pseudonymized(self, db: sqlite3.Connection, tmp_path: Path) -> None:
+        """Заголовок интервью не содержит имён (interview.name), дата из заголовка."""
+        from dataclasses import replace
+
+        path = tmp_path / "R01.txt"
+        path.write_text(
+            "Интервью с Петров П.П., 01.10.2026\n00:00:01	Петров П.П.	Я подключил счёт",
+            encoding="utf-8",
+        )
+        meta = replace(
+            _make_meta(),
+            interview_id="R01",
+            respondent_code="R01",
+            roles={"Петров П.П.": "RESPONDENT"},
+            names_to_codes={},
+            date=None,
+        )
+        load_transcript(db, path, meta, build_replacement_map(meta), PipelineSettings())
+        name, interview_date = db.execute(
+            "SELECT name, interview_date FROM interview WHERE id_external = 'R01'"
+        ).fetchone()
+        assert "Петров" not in name
+        assert "R01" in name
+        assert interview_date == "2026-10-01"
 
 
 @pytest.mark.real_transcript

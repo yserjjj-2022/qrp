@@ -30,6 +30,19 @@ _TABLES = [
     "code_proposal",
     "theme_proposal",
 ]
+_WORKBOOK_TABLES = [
+    "workbook_version",
+    "workbook_sheet",
+    "question_code",
+    "attribute_definition",
+    "glossary_term",
+    "lexicon",
+    "uncertainty_marker",
+    "golden_sample",
+    "reference_fact",
+    "interview_speaker",
+    "new_term",
+]
 
 
 @pytest.fixture()
@@ -45,23 +58,24 @@ class TestMigrations:
     """Проверка системы миграций."""
 
     def test_empty_db(self, tmp_db: tuple[sqlite3.Connection, Path, Path]) -> None:
-        """Миграции создают все таблицы каркаса и M1a на пустой БД."""
+        """Миграции создают все таблицы каркаса, M1a и рабочей книги."""
         conn, db_path, tmp_path = tmp_db
         backup_dir = tmp_path / "backups"
         applied = migrate(conn, db_path, _MIGRATIONS_DIR, backup_dir)
-        assert len(applied) == 2
+        expected = sorted(path.stem for path in _MIGRATIONS_DIR.glob("*.sql"))
+        assert applied == expected
+        assert len(applied) >= 3
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        for table in _TABLES + ["utterance"]:
+        for table in _TABLES + _WORKBOOK_TABLES:
             assert table in tables, f"Таблица {table} не найдена"
-        # Служебные таблицы-гарды удалены
         assert "_guard_empty" not in tables
         assert "_guard_fk" not in tables
-        # Колонки M1a в interview
         cols = {row[1] for row in conn.execute("PRAGMA table_info(interview)").fetchall()}
-        assert {"respondent_code", "group", "transcript_source"} <= cols
-        # Новый формат turn
+        assert {"respondent_code", "group", "transcript_source", "interview_date"} <= cols
         turn_cols = {row[1] for row in conn.execute("PRAGMA table_info(turn)").fetchall()}
         assert {"line_no", "start_sec", "speaker_role", "pii_flag"} <= turn_cols
+        code_cols = {row[1] for row in conn.execute("PRAGMA table_info(code)").fetchall()}
+        assert {"kind", "title", "tiebreak_rule"} <= code_cols
 
     def test_idempotent(self, tmp_db: tuple[sqlite3.Connection, Path, Path]) -> None:
         """Повторное применение не создаёт ошибок."""
