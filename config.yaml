@@ -1,7 +1,18 @@
 # Конфигурация проекта «анализатор интервью»
 # Переопределяет значения по умолчанию. Секреты — только в .env.
 
-db_path: data/interviews.db
+paths:
+  data: data
+  inputs: data/inputs
+  transcripts: data/inputs/transcripts
+  workbook: data/inputs/Rabochaya_kniga_proekta_v4.xlsx
+  db: data/db/interviews.db
+  backups: data/backups
+  cache: data/cache
+  exports: data/exports
+  golden: data/golden
+
+db_path: data/db/interviews.db
 data_dir: data
 log_level: INFO
 
@@ -26,3 +37,131 @@ m1b:
   len_ratio_min: 0.6
   len_ratio_max: 1.1
   review_sample_share: 0.10
+
+# Рабочая книга проекта. Код только читает книгу и никогда в неё не пишет.
+workbook:
+  required_sheets: ["Вопросы_и_коды", "Коды", "Атрибуты"]
+  optional_sheets:
+    - "Словарь_замен"
+    - "Темы"
+    - "Лексикон"
+    - "Маркеры_неуверенности"
+    - "Интервью"
+    - "Роли_говорящих"
+    - "Золотой_набор"
+  optional_prefixes: ["Факты_"]
+  ignored_sheets: ["Справка", "Эталон_Финам", "Было_стало"]
+  ignored_prefixes: ["_"]
+  # Версия кодбука определяется только этими листами.
+  codebook_sheets: ["Вопросы_и_коды", "Коды", "Атрибуты"]
+
+  # Маппинг «семья кода -> узел дерева тем» для случая, когда лист «Темы» пуст.
+  family_nodes:
+    "Риски": "Риски"
+    "Проверка": "Риски"
+    "Ошибки исполнения": "Риски"
+    "Ответственность": "Ответственность"
+    "Основание": "Ответственность"
+    "Контроль": "Ответственность"
+    "Предупреждения": "Предупреждения"
+    "Индуктивный": "Индуктивные"
+
+  # Значения по умолчанию для необязательных листов, которых нет в книге.
+  defaults:
+    uncertainty_markers:
+      - "не знаю"
+      - "не уверен"
+      - "наверное"
+      - "возможно"
+      - "кажется"
+      - "по-моему"
+      - "вроде"
+      - "не помню"
+      - "может быть"
+      - "скорее всего"
+      - "сложно сказать"
+      - "трудно сказать"
+      - "не задумывался"
+
+  # Соответствие «лист -> колонки -> типы полей». Код не содержит имён колонок.
+  # type: str | text | int | date | list | notes
+  # list_kind: code | question | plain (для type=list)
+  # strict: неизвестный идентификатор в списке — ошибка, а не заметка.
+  sheets:
+    Вопросы_и_коды:
+      columns:
+        question_id: {header: "id_вопроса", type: str, required: true}
+        block: {header: "блок", type: str}
+        group: {header: "группа", type: str}
+        wording: {header: "формулировка", type: text}
+        goal: {header: "что_хотим_понять", type: text}
+        codes: {header: "коды", type: list, list_kind: code}
+        notes: {header: "заметки", type: notes}
+    Коды:
+      columns:
+        code: {header: "код", type: str, required: true}
+        kind: {header: "тип", type: str}
+        family: {header: "семья", type: str, required: true}
+        title: {header: "название", type: str}
+        definition: {header: "определение", type: text}
+        include: {header: "включает", type: text}
+        exclude: {header: "исключает", type: text}
+        tiebreak_rule: {header: "правило_при_сомнении", type: text}
+        questions: {header: "вопросы", type: list, list_kind: question}
+    Атрибуты:
+      columns:
+        name: {header: "поле", type: str, required: true}
+        kind: {header: "тип", type: str}
+        description: {header: "описание", type: text}
+    Словарь_замен:
+      columns:
+        term: {header: "не_говорить", type: str, required: true}
+        replacement: {header: "говорить", type: text}
+    Темы:
+      columns:
+        node: {header: "узел", type: str, required: true}
+        theme: {header: "тема", type: str, required: true}
+        codes: {header: "коды (через ;)", type: list, list_kind: code, strict: true}
+        status: {header: "статус", type: str}
+        note: {header: "примечание", type: text}
+    Лексикон:
+      columns:
+        canonical: {header: "каноническое", type: str, required: true}
+        variants: {header: "варианты (через ;)", type: list, list_kind: plain}
+        definition: {header: "определение", type: text}
+        status: {header: "статус", type: str}
+    Маркеры_неуверенности:
+      columns:
+        expression: {header: "выражение", type: str, required: true}
+        note: {header: "примечание", type: text}
+    Интервью:
+      columns:
+        interview_id: {header: "id_интервью", type: str, required: true}
+        respondent_code: {header: "код_респондента", type: str}
+        group: {header: "группа", type: str}
+        date: {header: "дата", type: date}
+        transcript_file: {header: "файл_транскрипта", type: str}
+        transcript_source: {header: "источник_расшифровки", type: str}
+        note: {header: "примечание", type: text}
+    Роли_говорящих:
+      columns:
+        interview_id: {header: "id_интервью", type: str, required: true}
+        speaker_label: {header: "метка_говорящего", type: str, required: true}
+        role: {header: "роль", type: str, required: true}
+        words: {header: "слов", type: int}
+    Золотой_набор:
+      columns:
+        interview_code: {header: "id_интервью", type: str, required: true}
+        utterance_ref: {header: "ссылка_на_реплику", type: str}
+        text_l1: {header: "текст_L1", type: text, required: true}
+        text_l2_manual: {header: "текст_L2_вручную", type: text}
+
+  # Листы с префиксом «Факты_» используют эту схему колонок.
+  prefix_sheets:
+    "Факты_":
+      columns:
+        external_id: {header: "id", type: str, required: true}
+        question: {header: "вопрос", type: text}
+        answer: {header: "ответ", type: text}
+        comment: {header: "комментарий", type: text}
+        status: {header: "статус", type: str}

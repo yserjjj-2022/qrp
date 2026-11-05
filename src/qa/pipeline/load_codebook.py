@@ -1,215 +1,327 @@
-"""Загрузчик кодбука из приложения Б (Excel)."""
+"""Загрузка кодбука из рабочей книги: обязательные листы, Темы, Словарь_замен.
+
+Правила:
+- обязательные листы «Вопросы_и_коды», «Коды», «Атрибуты»; отсутствие листа или
+  колонки — ошибка с названием листа и номером строки;
+- коды уникальны, у каждого кода указана семья, перекрёстные ссылки валидны;
+- лист «Темы» используется, если непустой, иначе дерево строится по семьям;
+- повторная загрузка того же файла не создаёт дублей.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import sqlite3
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from openpyxl import load_workbook
-from openpyxl.workbook.workbook import Workbook
-from openpyxl.worksheet.worksheet import Worksheet
+from qa.db.workbook_repo import CodebookRepository, ThemeRepository, WorkbookRepository
+from qa.pipeline.workbook import SheetData, WorkbookData, WorkbookError, is_identifier_like, read_workbook
+from qa.settings import WorkbookSettings
 
 logger = logging.getLogger(__name__)
 
-_SHEET_CODES = "Коды"
-_SHEET_QUESTIONS = "Вопросы_и_коды"
-_SHEET_ATTRIBUTES = "Атрибуты"
-
-_REQUIRED_COLUMNS: dict[str, list[str]] = {
-    _SHEET_CODES: ["Код", "Семейство", "Название", "Определение", "Включаем", "Исключаем", "Привязка к вопросу"],
-    _SHEET_QUESTIONS: ["Код", "Идентификатор вопроса"],
-    _SHEET_ATTRIBUTES: ["Код", "Имя атрибута", "Значение"],
-}
+SHEET_QUESTIONS = "Вопросы_и_коды"
+SHEET_CODES = "Коды"
+SHEET_ATTRIBUTES = "Атрибуты"
+SHEET_THEMES = "Темы"
+SHEET_GLOSSARY = "Словарь_замен"
 
 
-def _file_hash(path: Path) -> str:
-    """SHA-256 хеш файла."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+class CodebookValidationError(WorkbookError):
+    """Нарушение перекрёстных ссылок или обязательных значений кодбука."""
 
 
-def _read_headers(ws: Worksheet) -> list[str]:
-    """Прочитать заголовки (первая строка) листа."""
-    return [str(cell.value) if cell.value is not None else "" for cell in ws[1]]
+@dataclass
+class LoadCodebookResult:
+    """Итог загрузки кодбука."""
+
+    codebook_version_id: int
+    workbook_version_id: int
+    created: bool
+    counts: dict[str, int] = field(default_factory=dict)
+    tree: list[tuple[str, list[tuple[str, list[str]]]]] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
-def _validate_sheet(ws: Worksheet, sheet_name: str) -> dict[str, int]:
-    """Проверить, что все обязательные колонки присутствуют. Вернуть имя->index."""
-    headers = _read_headers(ws)
-    required = _REQUIRED_COLUMNS[sheet_name]
-    col_map: dict[str, int] = {}
-    for col_name in required:
-        found = None
-        for i, h in enumerate(headers):
-            if h.strip() == col_name:
-                found = i
-                break
-        if found is None:
-            msg = f"В листе '{sheet_name}' не найдена колонка '{col_name}'. Доступные колонки: {headers}"
-            raise ValueError(msg)
-        col_map[col_name] = found
-    return col_map
+def _text(row: dict[str, Any], key: str) -> str | None:
+    """Строковое значение поля строки."""
+    value = row.get(key)
+    return None if value is None else str(value)
 
 
-def _row_value(row: tuple[Any, ...], col_map: dict[str, int], col_name: str) -> str | None:
-    """Получить значение ячейки, приведя к строке."""
-    idx = col_map[col_name]
-    if idx >= len(row):
-        return None
-    val = row[idx].value
-    if val is None:
-        return None
-    return str(val).strip()
+def _identifiers(row: dict[str, Any], field_name: str) -> list[str]:
+    """Идентификаторы кодов/вопросов из списка строки (без служебных пометок)."""
+    value = row.get(field_name)
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if is_identifier_like(str(item))]
 
 
-def load_codebook(conn: sqlite3.Connection, excel_path: Path) -> tuple[int, int, int]:
-    """Загрузить кодбук из Excel-файла в БД.
+def _require_unique(values: list[str], sheet: str, what: str) -> None:
+    """Проверить уникальность значений; ошибка с листом и повторами."""
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for value in values:
+        if value in seen:
+            duplicates.add(value)
+        seen.add(value)
+    if duplicates:
+        msg = f"Лист '{sheet}': повторяющиеся {what}: {sorted(duplicates)}"
+        raise CodebookValidationError(msg)
+
+
+def _cross_check(
+    codes: set[str],
+    questions: set[str],
+    code_rows: list[dict[str, Any]],
+    question_rows: list[dict[str, Any]],
+    theme_rows: list[dict[str, Any]],
+    workbook: WorkbookData,
+) -> None:
+    """Перекрёстные ссылки: коды у вопросов, вопросы у кодов, коды в темах."""
+    missing_code_links: list[str] = []
+    for row, row_number in zip(question_rows, workbook.sheets[SHEET_QUESTIONS].row_numbers, strict=True):
+        for item in _identifiers(row, "codes"):
+            if item not in codes:
+                missing_code_links.append(f"строка {row_number}: код {item!r}")
+    if missing_code_links:
+        msg = f"Лист '{SHEET_QUESTIONS}': нет таких кодов в листе «Коды»: {missing_code_links}"
+        raise WorkbookError(msg)
+
+    missing_question_links: list[str] = []
+    for row, row_number in zip(code_rows, workbook.sheets[SHEET_CODES].row_numbers, strict=True):
+        for item in _identifiers(row, "questions"):
+            if item not in questions:
+                missing_question_links.append(f"строка {row_number}: вопрос {item!r}")
+    if missing_question_links:
+        msg = f"Лист '{SHEET_CODES}': нет таких вопросов в листе «Вопросы_и_коды»: {missing_question_links}"
+        raise WorkbookError(msg)
+
+    missing_theme_codes: list[str] = []
+    themes_sheet = workbook.sheets.get(SHEET_THEMES)
+    row_numbers = themes_sheet.row_numbers if themes_sheet is not None else []
+    for row, row_number in zip(theme_rows, row_numbers, strict=True):
+        for item in _identifiers(row, "codes"):
+            if item not in codes:
+                missing_theme_codes.append(f"строка {row_number}: код {item!r}")
+    if missing_theme_codes:
+        msg = f"Лист '{SHEET_THEMES}': коды не найдены в листе «Коды»: {missing_theme_codes}"
+        raise WorkbookError(msg)
+
+
+def _validate_codebook_rows(
+    codes_sheet: SheetData,
+    questions_sheet: SheetData,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Проверить обязательные значения строк кодбука."""
+    code_rows = codes_sheet.rows
+    question_rows = questions_sheet.rows
+    for row, row_number in zip(code_rows, codes_sheet.row_numbers, strict=True):
+        if _text(row, "code") is None:
+            msg = f"Лист '{SHEET_CODES}', строка {row_number}: пустой код"
+            raise CodebookValidationError(msg)
+        if _text(row, "family") is None:
+            msg = f"Лист '{SHEET_CODES}', строка {row_number}: у кода {_text(row, 'code')!r} не указана семья"
+            raise CodebookValidationError(msg)
+    for row, row_number in zip(question_rows, questions_sheet.row_numbers, strict=True):
+        if _text(row, "question_id") is None:
+            msg = f"Лист '{SHEET_QUESTIONS}', строка {row_number}: пустой идентификатор вопроса"
+            raise CodebookValidationError(msg)
+    _require_unique([str(_text(row, "code")) for row in code_rows], SHEET_CODES, "коды")
+    _require_unique([str(_text(row, "question_id")) for row in question_rows], SHEET_QUESTIONS, "вопросы")
+    return code_rows, question_rows
+
+
+def _build_tree_from_themes(
+    theme_rows: list[dict[str, Any]],
+    code_ids: dict[str, int],
+    themes: ThemeRepository,
+) -> None:
+    """Собрать дерево из листа «Темы»: узел -> тема -> коды."""
+    nodes: dict[str, int] = {}
+    for row in theme_rows:
+        node_name = _text(row, "node")
+        theme_name = _text(row, "theme")
+        if node_name is None or theme_name is None:
+            continue
+        node_id = nodes.get(node_name)
+        if node_id is None:
+            node_id = themes.insert_node(node_name)
+            nodes[node_name] = node_id
+        theme_id = themes.insert_theme(theme_name, node_id)
+        for code in _identifiers(row, "codes"):
+            code_id = code_ids.get(code)
+            if code_id is not None:
+                themes.bind(theme_id, code_id)
+
+
+def _build_tree_from_families(
+    code_rows: list[dict[str, Any]],
+    code_ids: dict[str, int],
+    family_nodes: dict[str, str],
+    themes: ThemeRepository,
+) -> list[str]:
+    """Собрать дерево по семьям кодов с маппингом «семья -> узел»."""
+    unknown_families: list[str] = []
+    structure: dict[str, dict[str, list[str]]] = {}
+    for row in code_rows:
+        code = _text(row, "code")
+        family = _text(row, "family")
+        if code is None or family is None:
+            continue
+        node_name = family_nodes.get(family)
+        if node_name is None:
+            unknown_families.append(family)
+            node_name = family
+        structure.setdefault(node_name, {}).setdefault(family, []).append(code)
+    for node_name, families in structure.items():
+        node_id = themes.insert_node(node_name)
+        for family, codes in families.items():
+            theme_id = themes.insert_theme(family, node_id)
+            for code in codes:
+                code_id = code_ids.get(code)
+                if code_id is not None:
+                    themes.bind(theme_id, code_id)
+    return sorted(set(unknown_families))
+
+
+def _insert_codebook(
+    workbook: WorkbookData,
+    codebook_version_id: int,
+    code_rows: list[dict[str, Any]],
+    question_rows: list[dict[str, Any]],
+    codebook_repo: CodebookRepository,
+) -> None:
+    """Записать коды, вопросы, атрибуты, связи и словарь замен."""
+    codes_sheet = workbook.sheets[SHEET_CODES]
+    questions_sheet = workbook.sheets[SHEET_QUESTIONS]
+
+    code_ids = {str(_text(row, "code")): codebook_repo.insert_code(codebook_version_id, row) for row in code_rows}
+    question_ids = {
+        str(_text(row, "question_id")): codebook_repo.insert_question(codebook_version_id, row) for row in question_rows
+    }
+    for row in workbook.sheets[SHEET_ATTRIBUTES].rows:
+        codebook_repo.insert_attribute_definition(codebook_version_id, row)
+
+    for row in question_rows:
+        question_db_id = question_ids[str(_text(row, "question_id"))]
+        for code in _identifiers(row, "codes"):
+            codebook_repo.link_question_code(question_db_id, code_ids[code])
+    for row in code_rows:
+        code_db_id = code_ids[str(_text(row, "code"))]
+        for question in _identifiers(row, "questions"):
+            codebook_repo.link_question_code(question_ids[question], code_db_id)
+
+    glossary_sheet = workbook.sheet(SHEET_GLOSSARY)
+    for row in glossary_sheet.rows if glossary_sheet is not None else []:
+        term = _text(row, "term")
+        if term is None:
+            continue
+        for single in term.split(","):
+            item = single.strip()
+            if item:
+                codebook_repo.insert_glossary_term(codebook_version_id, item, _text(row, "replacement"))
+    logger.debug(
+        "Записаны листы %s и %s (коды=%s, вопросы=%s)",
+        codes_sheet.name,
+        questions_sheet.name,
+        len(code_rows),
+        len(question_rows),
+    )
+
+
+def load_codebook(
+    conn: sqlite3.Connection,
+    workbook_path: Path,
+    workbook_settings: WorkbookSettings,
+    *,
+    reload: bool = False,
+) -> LoadCodebookResult:
+    """Загрузить обязательные листы книги, темы и словарь замен.
 
     Args:
-        conn: подключение к SQLite
-        excel_path: путь к .xlsx файлу
-
-    Returns:
-        Кортеж (n_codes, n_questions, n_attributes).
+        conn: подключение к SQLite (миграции уже применены).
+        workbook_path: путь к .xlsx.
+        workbook_settings: классы листов и схемы колонок из config.yaml.
+        reload: пересобрать темы, даже если версия уже загружена.
 
     Raises:
         FileNotFoundError: файл не найден.
-        ValueError: отсутствует обязательный лист или колонка.
+        WorkbookError: нет обязательного листа или колонки.
+        CodebookValidationError: нарушены обязательные значения или ссылки.
     """
-    if not excel_path.exists():
-        msg = f"Файл не найден: {excel_path}"
-        raise FileNotFoundError(msg)
+    workbook = read_workbook(workbook_path, workbook_settings)
+    for warning in workbook.warnings:
+        if warning.startswith("Неизвестный лист"):
+            logger.warning(warning)
 
-    file_hash = _file_hash(excel_path)
+    workbook_repo = WorkbookRepository(conn)
+    codebook_repo = CodebookRepository(conn)
+    themes_repo = ThemeRepository(conn)
 
-    # Проверка на повторную загрузку
-    existing = conn.execute("SELECT id FROM codebook_version WHERE file_hash = ?", (file_hash,)).fetchone()
-    if existing is not None:
-        logger.info("Кодбук уже загружен (hash=%s, version_id=%s)", file_hash[:12], existing[0])
-        return _count_records(conn, existing[0])
+    existing_workbook = workbook_repo.find_by_hash(workbook.file_hash)
+    existing_codebook = codebook_repo.find_by_codebook_hash(workbook.codebook_hash)
 
-    wb = load_workbook(excel_path, read_only=True, data_only=True)
+    if existing_workbook is not None and existing_codebook is not None and not reload:
+        logger.info("Книга уже загружена (hash=%s), дублей нет", workbook.file_hash[:12])
+        return LoadCodebookResult(
+            codebook_version_id=existing_codebook,
+            workbook_version_id=existing_workbook,
+            created=False,
+            counts=codebook_repo.counts(existing_codebook),
+            tree=themes_repo.tree(),
+            notes=workbook.warnings,
+        )
 
-    # Проверяем наличие всех обязательных листов
-    for sheet_name in (_SHEET_CODES, _SHEET_QUESTIONS, _SHEET_ATTRIBUTES):
-        if sheet_name not in wb.sheetnames:
-            msg = f"В файле отсутствует обязательный лист '{sheet_name}'. Доступные листы: {wb.sheetnames}"
-            raise ValueError(msg)
+    codes_sheet = workbook.sheets[SHEET_CODES]
+    questions_sheet = workbook.sheets[SHEET_QUESTIONS]
+    code_rows, question_rows = _validate_codebook_rows(codes_sheet, questions_sheet)
 
-    # Создаём версию
-    conn.execute("INSERT INTO codebook_version (file_hash) VALUES (?)", (file_hash,))
-    version_id: int = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    themes_sheet = workbook.sheet(SHEET_THEMES)
+    theme_rows = themes_sheet.rows if themes_sheet is not None else []
+    _cross_check(
+        {str(_text(row, "code")) for row in code_rows},
+        {str(_text(row, "question_id")) for row in question_rows},
+        code_rows,
+        question_rows,
+        theme_rows,
+        workbook,
+    )
 
-    n_codes = _load_codes(conn, wb, version_id)
-    n_questions = _load_questions(conn, wb, version_id)
-    n_attributes = _load_attributes(conn, wb, version_id)
+    workbook_version_id = existing_workbook if existing_workbook is not None else workbook_repo.insert(workbook)
+    if existing_codebook is not None:
+        codebook_version_id = existing_codebook
+    else:
+        codebook_version_id = codebook_repo.insert_version(workbook_version_id, workbook.codebook_hash)
+        _insert_codebook(workbook, codebook_version_id, code_rows, question_rows, codebook_repo)
+    code_ids = codebook_repo.code_ids(codebook_version_id)
+
+    themes_repo.clear()
+    notes: list[str] = []
+    if theme_rows:
+        _build_tree_from_themes(theme_rows, code_ids, themes_repo)
+    else:
+        unknown = _build_tree_from_families(code_rows, code_ids, workbook_settings.family_nodes, themes_repo)
+        notes = [f"Семья без маппинга в узел: {family}" for family in unknown]
+        for note in notes:
+            logger.warning(note)
 
     conn.commit()
-    wb.close()
-
+    counts = codebook_repo.counts(codebook_version_id)
     logger.info(
-        "Кодбук загружен: version_id=%s, codes=%s, questions=%s, attributes=%s",
-        version_id,
-        n_codes,
-        n_questions,
-        n_attributes,
+        "Кодбук загружен: version_id=%s, codes=%s, questions=%s, links=%s",
+        codebook_version_id,
+        counts["codes"],
+        counts["questions"],
+        counts["question_code"],
     )
-    return n_codes, n_questions, n_attributes
-
-
-def _load_codes(conn: sqlite3.Connection, wb: Workbook, version_id: int) -> int:
-    """Загрузить лист Коды."""
-    ws: Worksheet = wb[_SHEET_CODES]
-    col_map = _validate_sheet(ws, _SHEET_CODES)
-
-    n = 0
-    for row in ws.iter_rows(min_row=2, values_only=False):
-        code_id_str = _row_value(row, col_map, "Код")
-        if not code_id_str:
-            continue
-        family = _row_value(row, col_map, "Семейство")
-        definition = _row_value(row, col_map, "Определение")
-        include = _row_value(row, col_map, "Включаем")
-        exclude = _row_value(row, col_map, "Исключаем")
-        # "Название" сохраняем в definition, если определение пустое
-        name = _row_value(row, col_map, "Название")
-        if not definition and name:
-            definition = name
-
-        conn.execute(
-            "INSERT OR IGNORE INTO code "
-            "(codebook_version_id, family, name, definition, include, exclude, origin, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'base', 'active')",
-            (version_id, family, code_id_str, definition, include, exclude),
-        )
-        n += 1
-
-    return n
-
-
-def _load_questions(conn: sqlite3.Connection, wb: Workbook, version_id: int) -> int:
-    """Загрузить лист Вопросы_и_коды."""
-    ws: Worksheet = wb[_SHEET_QUESTIONS]
-    col_map = _validate_sheet(ws, _SHEET_QUESTIONS)
-
-    n = 0
-    for row in ws.iter_rows(min_row=2, values_only=False):
-        identifier = _row_value(row, col_map, "Идентификатор вопроса")
-        if not identifier:
-            continue
-        conn.execute(
-            "INSERT OR IGNORE INTO question (codebook_version_id, identifier) VALUES (?, ?)",
-            (version_id, identifier),
-        )
-        n += 1
-
-    return n
-
-
-def _load_attributes(conn: sqlite3.Connection, wb: Workbook, version_id: int) -> int:
-    """Загрузить лист Атрибуты."""
-    ws = wb[_SHEET_ATTRIBUTES]
-    col_map = _validate_sheet(ws, _SHEET_ATTRIBUTES)
-
-    # Строим карту code_name -> code_id
-    code_map: dict[str, int] = {}
-    for row in conn.execute("SELECT id, name FROM code WHERE codebook_version_id = ?", (version_id,)):
-        code_map[row[1]] = row[0]
-
-    n = 0
-    for row in ws.iter_rows(min_row=2, values_only=False):
-        code_name = _row_value(row, col_map, "Код")
-        attr_name = _row_value(row, col_map, "Имя атрибута")
-        attr_value = _row_value(row, col_map, "Значение")
-        if not code_name or not attr_name:
-            continue
-        code_id = code_map.get(code_name)
-        if code_id is None:
-            logger.warning("Атрибут '%s' ссылается на неизвестный код '%s'", attr_name, code_name)
-            continue
-        conn.execute(
-            "INSERT OR IGNORE INTO attribute (code_id, name, value) VALUES (?, ?, ?)",
-            (code_id, attr_name, attr_value),
-        )
-        n += 1
-
-    return n
-
-
-def _count_records(conn: sqlite3.Connection, version_id: int) -> tuple[int, int, int]:
-    """Посчитать записи для версии."""
-    n_codes = conn.execute("SELECT COUNT(*) FROM code WHERE codebook_version_id = ?", (version_id,)).fetchone()[0]
-    n_questions = conn.execute("SELECT COUNT(*) FROM question WHERE codebook_version_id = ?", (version_id,)).fetchone()[
-        0
-    ]
-    n_attributes = conn.execute(
-        "SELECT COUNT(*) FROM attribute a JOIN code c ON a.code_id = c.id WHERE c.codebook_version_id = ?",
-        (version_id,),
-    ).fetchone()[0]
-    return int(n_codes), int(n_questions), int(n_attributes)
+    return LoadCodebookResult(
+        codebook_version_id=codebook_version_id,
+        workbook_version_id=workbook_version_id,
+        created=existing_codebook is None,
+        counts=counts,
+        tree=themes_repo.tree(),
+        notes=workbook.warnings + notes,
+    )
