@@ -2,6 +2,10 @@
 
 Формат входа: UTF-8 (возможна BOM). Первая строка — заголовок.
 Далее записи `ЧЧ:ММ:СС<TAB>Метка говорящего<TAB>Текст`, одна на строку.
+
+Код респондента берётся из имени файла (R01.txt), дата — из заголовка.
+Роли говорящих определяются по числу слов и подтверждаются оператором.
+Заголовок интервью (interview.name) тоже проходит псевдонимизацию.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +28,12 @@ logger = logging.getLogger(__name__)
 ROLES = frozenset({"INTERVIEWER", "RESPONDENT", "OBSERVER"})
 
 _LINE_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\t([^\t]+)\t(.*)$")
+_RESPONDENT_CODE_RE = re.compile(r"^R\d+$")
+_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_DATE_DOTTED_RE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\b")
 
-# Фильтр шаблонов PII (CONSTITUTION §5): совпадения помечаются, не удаляются
+# Фильтр шаблонов PII (CONSTITUTION §5): совпадения помечаются, не удаляются.
+# pii_flag только помечает: загрузка и отправка в модель не блокируются.
 _PII_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"),  # e-mail
     re.compile(r"(?:\+7|8)[\s(]*\d{3}[\s)]*\d{3}[\s-]*\d{2}[\s-]*\d{2}"),  # телефон
@@ -37,7 +46,7 @@ class TranscriptParseError(Exception):
 
 
 class TranscriptMetaError(Exception):
-    """Ошибка в interview.yaml."""
+    """Ошибка метаданных интервью."""
 
 
 @dataclass(frozen=True)
@@ -52,15 +61,15 @@ class TranscriptRecord:
 
 @dataclass(frozen=True)
 class InterviewMeta:
-    """Метаданные интервью из interview.yaml."""
+    """Метаданные интервью (из листа «Интервью» или вычисленные по транскрипту)."""
 
     interview_id: str
     respondent_code: str
     group: str
     roles: dict[str, str]
     names_to_codes: dict[str, str]
-    date: str
-    transcript_source: str
+    date: str | None
+    transcript_source: str | None
 
 
 @dataclass
@@ -125,8 +134,81 @@ def parse_transcript(path: Path) -> tuple[str, list[TranscriptRecord]]:
     return header, records
 
 
+def parse_header_date(header: str) -> str | None:
+    """Дата интервью из заголовка: ISO или ДД.ММ.ГГГГ.
+
+    Raises:
+        TranscriptMetaError: дата выглядит некорректной.
+    """
+    iso = _DATE_RE.search(header)
+    if iso is not None:
+        year, month, day = (int(part) for part in iso.groups())
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError as exc:
+            msg = f"Некорректная дата в заголовке транскрипта: {iso.group(0)!r}"
+            raise TranscriptMetaError(msg) from exc
+    dotted = _DATE_DOTTED_RE.search(header)
+    if dotted is not None:
+        day, month, year = (int(part) for part in dotted.groups())
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError as exc:
+            msg = f"Некорректная дата в заголовке транскрипта: {dotted.group(0)!r}"
+            raise TranscriptMetaError(msg) from exc
+    return None
+
+
+def respondent_code_from_filename(path: Path) -> str:
+    """Код респондента из имени файла: R01.txt -> R01.
+
+    Raises:
+        TranscriptMetaError: имя файла не содержит кода вида R01.
+    """
+    stem = path.stem.strip()
+    if not _RESPONDENT_CODE_RE.match(stem):
+        msg = f"Имя файла {path.name!r} не содержит кода респондента вида R01. Переименуйте файл по коду респондента"
+        raise TranscriptMetaError(msg)
+    return stem
+
+
+def count_speaker_words(records: list[TranscriptRecord]) -> dict[str, int]:
+    """Число слов по меткам говорящих (в порядке первого появления)."""
+    counts: dict[str, int] = {}
+    for record in records:
+        counts.setdefault(record.speaker_label, 0)
+        counts[record.speaker_label] += len(re.findall(r"[\w-]+", record.text, flags=re.UNICODE))
+    return counts
+
+
+def propose_roles(word_counts: dict[str, int]) -> dict[str, str]:
+    """Предложить роли: больше всего слов — респондент, второй — интервьюер.
+
+    Остальные говорящие получают роль наблюдателя. При равенстве слов порядок
+    появления в транскрипте сохраняется.
+    """
+    ordered = sorted(word_counts.items(), key=lambda item: (-item[1], list(word_counts).index(item[0])))
+    roles: dict[str, str] = {}
+    for index, (label, _words) in enumerate(ordered):
+        if index == 0:
+            roles[label] = "RESPONDENT"
+        elif index == 1:
+            roles[label] = "INTERVIEWER"
+        else:
+            roles[label] = "OBSERVER"
+    return roles
+
+
+def format_roles_table(word_counts: dict[str, int], roles: dict[str, str]) -> str:
+    """Таблица предложенных ролей для показа оператору."""
+    lines = ["Предложенные роли говорящих:", "  метка\tслов\tроль"]
+    for label, words in word_counts.items():
+        lines.append(f"  {label}\t{words}\t{roles.get(label, '?')}")
+    return "\n".join(lines)
+
+
 def load_meta(path: Path) -> InterviewMeta:
-    """Прочитать и проверить interview.yaml.
+    """Прочитать и проверить устаревший interview.yaml (совместимость).
 
     Raises:
         TranscriptMetaError: отсутствует поле или роль вне списка.
@@ -177,7 +259,7 @@ def pseudonymize(text: str, replacement_map: dict[str, str]) -> str:
 
 
 def detect_pii(text: str) -> bool:
-    """Есть ли в тексте совпадения с шаблонами PII."""
+    """Есть ли в тексте совпадения с шаблонами PII (только пометка)."""
     return any(p.search(text) for p in _PII_PATTERNS)
 
 
@@ -257,7 +339,8 @@ def load_transcript(
 ) -> LoadResult:
     """Разобрать транскрипт, псевдонимизировать, пометить PII, собрать реплики, записать в БД.
 
-    Повторная загрузка того же interview_id не создаёт дублей.
+    Заголовок интервью тоже проходит псевдонимизацию. Повторная загрузка того же
+    interview_id не создаёт дублей.
     """
     existing = conn.execute("SELECT id FROM interview WHERE id_external = ?", (meta.interview_id,)).fetchone()
     if existing is not None:
@@ -266,20 +349,30 @@ def load_transcript(
 
     header, records = parse_transcript(transcript_path)
 
-    # Проверка меток: каждая метка транскрипта должна быть описана в ролях
     unknown = {r.speaker_label for r in records} - set(meta.roles)
     if unknown:
-        msg = f"Метки говорящих не описаны в interview.yaml: {sorted(unknown)}"
+        msg = f"Метки говорящих не описаны в ролях интервью: {sorted(unknown)}"
         raise TranscriptMetaError(msg)
 
+    interview_date = meta.date or parse_header_date(header)
+    safe_header = pseudonymize(header, replacement_map)
+
     interview_id_raw = conn.execute(
-        'INSERT INTO interview (id_external, name, respondent_code, "group", transcript_source) VALUES (?, ?, ?, ?, ?)',
-        (meta.interview_id, header, meta.respondent_code, meta.group, meta.transcript_source),
+        'INSERT INTO interview (id_external, name, respondent_code, "group", transcript_source, interview_date)'
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (meta.interview_id, safe_header, meta.respondent_code, meta.group, meta.transcript_source, interview_date),
     ).lastrowid
     if interview_id_raw is None:
         msg = "SQLite не вернул id вставленной строки interview"
         raise sqlite3.Error(msg)
-    interview_id = interview_id_raw
+    interview_id = int(interview_id_raw)
+
+    for label, role in meta.roles.items():
+        words = sum(len(re.findall(r"[\w-]+", r.text, flags=re.UNICODE)) for r in records if r.speaker_label == label)
+        conn.execute(
+            "INSERT OR IGNORE INTO interview_speaker (interview_id, speaker_label, role, words) VALUES (?, ?, ?, ?)",
+            (interview_id, label, role, words),
+        )
 
     turns: list[tuple[int, str, str]] = []
     n_pii = 0
@@ -296,7 +389,7 @@ def load_transcript(
         if turn_id_raw is None:
             msg = f"SQLite не вернул id вставленной строки turn (строка {rec.line_no})"
             raise sqlite3.Error(msg)
-        turn_id = turn_id_raw
+        turn_id = int(turn_id_raw)
         turns.append((turn_id, role, text))
 
     drafts = build_utterances(turns, set(pipeline.backchannel_words), pipeline.backchannel_max_words)
@@ -330,5 +423,27 @@ def load_names_map(env_path: str) -> dict[str, str]:
         msg = f"NAMES_MAP_PATH указывает на несуществующий файл: {path}"
         raise FileNotFoundError(msg)
     with open(path, encoding="utf-8") as f:
-        data: dict[str, str] = yaml.safe_load(f)
-    return dict(data)
+        data: dict[str, str] = yaml.safe_load(f) or {}
+    return {str(key): str(value) for key, value in dict(data).items()}
+
+
+def ensure_names_map_skeleton(env_path: str, labels: list[str]) -> Path:
+    """Создать заготовку таблицы «имя -> код» вне проекта, если файла нет.
+
+    Существующий файл не перезаписывается: дописываются только новые метки.
+    """
+    path = Path(env_path)
+    data: dict[str, str] = {}
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            data = {str(key): str(value) for key, value in (yaml.safe_load(f) or {}).items()}
+    changed = False
+    for label in labels:
+        if label not in data:
+            data[label] = ""
+            changed = True
+    if changed or not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=True)
+    return path
