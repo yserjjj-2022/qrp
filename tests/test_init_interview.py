@@ -232,7 +232,7 @@ class TestHeaderSanitizing:
         mapping = build_replacement_map(meta)
         assert mapping["Петров П.П."] == "R01"
 
-        load_transcript(db, path, meta, mapping, PipelineSettings())
+        load_transcript(db, path, meta, mapping, PipelineSettings(), groups=_GROUPS)
 
         name, interview_date = db.execute(
             "SELECT name, interview_date FROM interview WHERE id_external = 'R01'"
@@ -240,3 +240,65 @@ class TestHeaderSanitizing:
         assert "Петров" not in name
         assert "R01" in name
         assert interview_date == "2026-10-01"
+
+
+class TestInitThenLoad:
+    """Цепочка init-interview -> load-transcript на одной БД."""
+
+    def test_init_then_load_fills_turns(self, db: sqlite3.Connection, transcript: Path) -> None:
+        from qa.pipeline.load_transcript import build_replacement_map, load_transcript
+        from qa.settings import PipelineSettings
+
+        plan = build_plan(db, transcript, "не торгующие", _GROUPS)
+        apply_plan(db, plan, _GROUPS)
+        assert db.execute("SELECT COUNT(*) FROM interview").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM turn").fetchone()[0] == 0
+
+        meta = plan_to_meta(plan)
+        result = load_transcript(db, transcript, meta, build_replacement_map(meta), PipelineSettings(), groups=_GROUPS)
+        assert result.skipped is False
+        assert result.n_turns == 4
+        assert db.execute("SELECT COUNT(*) FROM interview").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM turn").fetchone()[0] == 4
+        group, interview_date = db.execute('SELECT "group", interview_date FROM interview').fetchone()
+        assert group == "Не торгующие"
+        assert interview_date == "2026-11-02"
+
+    def test_repeat_load_skips_without_duplicates(self, db: sqlite3.Connection, transcript: Path) -> None:
+        from qa.pipeline.load_transcript import build_replacement_map, load_transcript
+        from qa.settings import PipelineSettings
+
+        plan = build_plan(db, transcript, "не торгующие", _GROUPS)
+        apply_plan(db, plan, _GROUPS)
+        meta = plan_to_meta(plan)
+        mapping = build_replacement_map(meta)
+        first = load_transcript(db, transcript, meta, mapping, PipelineSettings(), groups=_GROUPS)
+        second = load_transcript(db, transcript, meta, mapping, PipelineSettings(), groups=_GROUPS)
+
+        assert first.skipped is False
+        assert second.skipped is True
+        assert db.execute("SELECT COUNT(*) FROM interview").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM turn").fetchone()[0] == first.n_turns
+        assert db.execute("SELECT COUNT(*) FROM utterance").fetchone()[0] == first.n_utterances
+
+    def test_metadata_row_completed_not_replaced(self, db: sqlite3.Connection, transcript: Path) -> None:
+        """Строка из листа «Интервью» без записей дополняется заголовком и датой транскрипта."""
+        from qa.pipeline.load_transcript import build_replacement_map, load_transcript
+        from qa.settings import PipelineSettings
+
+        db.execute(
+            'INSERT INTO interview (id_external, name, respondent_code, "group", interview_date)'
+            " VALUES ('R01', NULL, 'R01', 'не торгующие', '2026-10-15')"
+        )
+        db.commit()
+        plan = build_plan(db, transcript, None, _GROUPS)
+        meta = plan_to_meta(plan)
+        result = load_transcript(db, transcript, meta, build_replacement_map(meta), PipelineSettings(), groups=_GROUPS)
+
+        assert result.skipped is False
+        rows = db.execute('SELECT id, name, "group", interview_date FROM interview').fetchall()
+        assert len(rows) == 1
+        _id, name, group, interview_date = rows[0]
+        assert name is not None
+        assert group == "Не торгующие"
+        assert interview_date == "2026-11-02"

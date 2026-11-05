@@ -78,21 +78,31 @@ class TestFlowWithoutTorgQuestions:
         stored_group = db.execute("SELECT \"group\" FROM interview WHERE id_external = 'R01'").fetchone()[0]
         assert stored_group == "Не торгующие"
 
-        # Интервью уже описано листом «Интервью»: повторная загрузка не создаёт дублей.
+        # Интервью описано листом «Интервью» без записей: строка дополняется, не дублируется.
         transcript_r01 = tmp_path / "R01.txt"
         transcript_r01.write_text(_TRANSCRIPT.replace("R02", "R01"), encoding="utf-8")
         plan_r01 = build_plan(db, transcript_r01, "не торгующие", settings.groups)
         assert plan_r01.group == "Не торгующие"
-        result_r01 = load_transcript(db, transcript_r01, plan_to_meta(plan_r01), {}, settings.pipeline)
-        assert result_r01.skipped is True
+        result_r01 = load_transcript(
+            db, transcript_r01, plan_to_meta(plan_r01), {}, settings.pipeline, groups=settings.groups
+        )
+        assert result_r01.skipped is False
+        assert result_r01.n_turns == 4
         assert db.execute("SELECT COUNT(*) FROM interview WHERE id_external = 'R01'").fetchone()[0] == 1
+
+        # Повторная загрузка: записи уже есть — пропуск без дублей.
+        again = load_transcript(
+            db, transcript_r01, plan_to_meta(plan_r01), {}, settings.pipeline, groups=settings.groups
+        )
+        assert again.skipped is True
+        assert db.execute("SELECT COUNT(*) FROM turn").fetchone()[0] == 4
 
         # Новое интервью без init-interview: план берёт группу из --group, транскрипт пишется.
         transcript = tmp_path / "R02.txt"
         transcript.write_text(_TRANSCRIPT, encoding="utf-8")
         plan = build_plan(db, transcript, "не торгующие", settings.groups)
         assert plan.group == "Не торгующие"
-        result = load_transcript(db, transcript, plan_to_meta(plan), {}, settings.pipeline)
+        result = load_transcript(db, transcript, plan_to_meta(plan), {}, settings.pipeline, groups=settings.groups)
         assert result.skipped is False
         assert result.n_turns == 4
         group = db.execute("SELECT \"group\" FROM interview WHERE id_external = 'R02'").fetchone()[0]

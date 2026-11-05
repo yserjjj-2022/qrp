@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from qa.settings import PipelineSettings
+from qa.settings import GroupsSettings, PipelineSettings, normalize_group
 
 logger = logging.getLogger(__name__)
 
@@ -336,14 +336,28 @@ def load_transcript(
     meta: InterviewMeta,
     replacement_map: dict[str, str],
     pipeline: PipelineSettings,
+    *,
+    groups: GroupsSettings | None = None,
 ) -> LoadResult:
     """Разобрать транскрипт, псевдонимизировать, пометить PII, собрать реплики, записать в БД.
 
-    Заголовок интервью тоже проходит псевдонимизацию. Повторная загрузка того же
-    interview_id не создаёт дублей.
+    Заголовок интервью тоже проходит псевдонимизацию. Пропуск только если у интервью
+    уже есть записи turn. Если строка interview создана раньше (init-interview или лист
+    «Интервью») и записей ещё нет, строка дополняется, а не дублируется.
+
+    Args:
+        groups: канонические значения групп для нормализации группы интервью.
+
+    Raises:
+        TranscriptParseError: файл не по формату.
+        TranscriptMetaError: метки говорящих не описаны в ролях интервью.
     """
-    existing = conn.execute("SELECT id FROM interview WHERE id_external = ?", (meta.interview_id,)).fetchone()
-    if existing is not None:
+    existing = conn.execute(
+        "SELECT i.id, (SELECT COUNT(*) FROM turn t WHERE t.interview_id = i.id)"
+        " FROM interview i WHERE i.id_external = ?",
+        (meta.interview_id,),
+    ).fetchone()
+    if existing is not None and int(existing[1]) > 0:
         logger.info("Интервью %s уже загружено (id=%s), пропуск", meta.interview_id, existing[0])
         return LoadResult(interview_id=existing[0], n_turns=0, n_utterances=0, n_pii_flagged=0, skipped=True)
 
@@ -356,21 +370,33 @@ def load_transcript(
 
     interview_date = meta.date or parse_header_date(header)
     safe_header = pseudonymize(header, replacement_map)
+    group = normalize_group(meta.group, groups)
 
-    interview_id_raw = conn.execute(
-        'INSERT INTO interview (id_external, name, respondent_code, "group", transcript_source, interview_date)'
-        " VALUES (?, ?, ?, ?, ?, ?)",
-        (meta.interview_id, safe_header, meta.respondent_code, meta.group, meta.transcript_source, interview_date),
-    ).lastrowid
-    if interview_id_raw is None:
-        msg = "SQLite не вернул id вставленной строки interview"
-        raise sqlite3.Error(msg)
-    interview_id = int(interview_id_raw)
+    if existing is None:
+        interview_id_raw = conn.execute(
+            'INSERT INTO interview (id_external, name, respondent_code, "group", transcript_source, interview_date)'
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (meta.interview_id, safe_header, meta.respondent_code, group, meta.transcript_source, interview_date),
+        ).lastrowid
+        if interview_id_raw is None:
+            msg = "SQLite не вернул id вставленной строки interview"
+            raise sqlite3.Error(msg)
+        interview_id = int(interview_id_raw)
+    else:
+        interview_id = int(existing[0])
+        conn.execute(
+            'UPDATE interview SET name = ?, respondent_code = ?, "group" = ?,'
+            " transcript_source = COALESCE(?, transcript_source),"
+            " interview_date = COALESCE(?, interview_date) WHERE id = ?",
+            (safe_header, meta.respondent_code, group, meta.transcript_source, interview_date, interview_id),
+        )
+        logger.info("Интервью %s дополнено записями транскрипта (id=%s)", meta.interview_id, interview_id)
 
     for label, role in meta.roles.items():
         words = sum(len(re.findall(r"[\w-]+", r.text, flags=re.UNICODE)) for r in records if r.speaker_label == label)
         conn.execute(
-            "INSERT OR IGNORE INTO interview_speaker (interview_id, speaker_label, role, words) VALUES (?, ?, ?, ?)",
+            "INSERT INTO interview_speaker (interview_id, speaker_label, role, words) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(interview_id, speaker_label) DO UPDATE SET role = excluded.role, words = excluded.words",
             (interview_id, label, role, words),
         )
 

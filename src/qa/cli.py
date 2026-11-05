@@ -155,7 +155,9 @@ def cmd_load_transcript(args: argparse.Namespace) -> int:
                 return 1
             meta = plan_to_meta(plan, resolve_names_map())
         replacement_map = build_replacement_map(meta, resolve_names_map())
-        result = load_transcript(conn, transcript_path, meta, replacement_map, settings.pipeline)
+        result = load_transcript(
+            conn, transcript_path, meta, replacement_map, settings.pipeline, groups=settings.groups
+        )
     finally:
         conn.close()
     if result.skipped:
