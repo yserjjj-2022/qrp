@@ -30,7 +30,7 @@
 | line_no | INTEGER NOT NULL | Номер строки в исходном файле (L0) |
 | start_sec | INTEGER NOT NULL | Метка начала реплики в секундах |
 | speaker_role | TEXT NOT NULL | INTERVIEWER / RESPONDENT / OBSERVER |
-| speaker_label | TEXT | Метка говорящего из транскрипта (миграция 0004) |
+| speaker_label | TEXT | **Настоящие имена говорящих.** Служебное поле: не выводить в логи, отчёты, тексты L1/L2 и не передавать во внешние сервисы (CONSTITUTION §5) |
 | text | TEXT NOT NULL | Текст L1 (псевдонимизированный) |
 | pii_flag | INTEGER NOT NULL DEFAULT 0 | Совпадение с шаблонами PII (на ручную проверку) |
 
@@ -327,7 +327,7 @@
 |------|-----|----------|
 | id | INTEGER PRIMARY KEY | Автоинкремент |
 | interview_id | INTEGER NOT NULL | Ссылка на interview |
-| speaker_label | TEXT NOT NULL | Метка из транскрипта |
+| speaker_label | TEXT NOT NULL | **Настоящие имена говорящих.** Служебное поле: только локальная БД, не для логов, отчётов и внешних сервисов |
 | role | TEXT NOT NULL | INTERVIEWER / RESPONDENT / OBSERVER |
 | words | INTEGER NOT NULL DEFAULT 0 | Число слов |
 | UNIQUE(interview_id, speaker_label) | | |

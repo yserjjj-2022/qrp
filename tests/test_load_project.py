@@ -200,3 +200,25 @@ class TestLoadProject:
         assert result.counts["facts"] == 1
         fetched = db.execute("SELECT sheet_name, external_id, answer FROM reference_fact").fetchone()
         assert tuple(fetched) == ("Факты_Финам", "F1", "только чтение")
+
+    def test_unknown_role_not_written(self, db: sqlite3.Connection, tmp_path: Path, settings: Settings) -> None:
+        path = build_workbook(
+            tmp_path / "book.xlsx",
+            extra_sheets={"Роли_говорящих": [["R01", "A", "LEAD", 3]]},
+        )
+        _loaded(db, path, settings)
+        result = _project(db, path, settings)
+        db.commit()
+
+        assert db.execute("SELECT COUNT(*) FROM interview_speaker").fetchone()[0] == 0
+        assert any("LEAD" in item and "не распознана" in item for item in result.discrepancies)
+
+    def test_role_case_insensitive(self, db: sqlite3.Connection, tmp_path: Path, settings: Settings) -> None:
+        path = build_workbook(
+            tmp_path / "book.xlsx",
+            extra_sheets={"Роли_говорящих": [["R01", "A", "respondent", 3]]},
+        )
+        _loaded(db, path, settings)
+        _project(db, path, settings)
+        role = db.execute("SELECT role FROM interview_speaker").fetchone()[0]
+        assert role == "RESPONDENT"

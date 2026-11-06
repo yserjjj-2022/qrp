@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class SpeakerRolesError(Exception):
-    """Роли нельзя применить без потери данных."""
+    """Роли не применяются: иначе данные будут потеряны или испорчены."""
 
 
 @dataclass
@@ -39,6 +39,7 @@ class SpeakerRolesResult:
     speakers_updated: int = 0
     turns_updated: int = 0
     utterances_rebuilt: int = 0
+    roles_unchanged: bool = False
     notes: list[str] = field(default_factory=list)
 
 
@@ -61,8 +62,7 @@ def _fill_missing_labels(
         return
     if transcript_path is None or not transcript_path.exists():
         result.notes.append(
-            f"Интервью {result.interview_id}: у {len(missing)} записей нет метки говорящего,"
-            " транскрипт не найден — роли к ним не применимы"
+            f"Интервью {result.interview_id}: у {len(missing)} записей нет метки говорящего, транскрипт не найден"
         )
         return
     labels_by_line = _labels_from_transcript(transcript_path)
@@ -76,13 +76,69 @@ def _fill_missing_labels(
         )
 
 
-def _check_rebuild_allowed(repo: InterviewRepository, interview_db_id: int, interview_id: str) -> None:
-    """Пересборка реплик меняет их id, а на id могут ссылаться кандидаты новых терминов."""
-    linked = repo.new_terms_on_utterances(interview_db_id)
-    if linked:
+def _check_labels_complete(repo: InterviewRepository, interview_db_id: int, interview_id: str) -> None:
+    """Без метки нельзя определить, чью роль менять: применение прерывается."""
+    without_label = repo.count_turns_without_label(interview_db_id)
+    if without_label:
         msg = (
-            f"Интервью {interview_id}: на реплики ссылается кандидатов новых терминов — {linked}."
-            " Пересборка реплик потеряет эти ссылки. Сначала закройте ревью (review-terms)"
+            f"Интервью {interview_id}: у {without_label} записей нет метки говорящего,"
+            " транскрипт не найден. Применение ролей остановлено, БД не изменена"
+        )
+        raise SpeakerRolesError(msg)
+
+
+def _check_rebuild_allowed(repo: InterviewRepository, interview_db_id: int, interview_id: str) -> None:
+    """Пересборка реплик меняет их id, а на id могут ссылаться другие данные."""
+    blockers: list[str] = []
+    new_terms = repo.new_terms_on_utterances(interview_db_id)
+    if new_terms:
+        blockers.append(f"кандидаты новых терминов (new_term): {new_terms}")
+    golden = repo.golden_refs_on_utterances(interview_db_id)
+    if golden:
+        blockers.append(f"золотой набор (golden_sample, utterance:<id>): {golden}")
+    text_units = repo.text_unit_refs_on_utterances(interview_db_id)
+    if text_units:
+        blockers.append(f"единицы L2 (text_unit): {text_units}")
+    annotations = repo.annotation_refs_on_turns(interview_db_id)
+    if annotations:
+        blockers.append(f"аннотации на фрагменты записей: {annotations}")
+    if blockers:
+        msg = (
+            f"Интервью {interview_id}: пересборка реплик потеряет ссылки — "
+            + "; ".join(blockers)
+            + ". Роли не применены, БД не изменена"
+            " (для new_term сначала закройте ревью командой review-terms)"
+        )
+        raise SpeakerRolesError(msg)
+
+
+def _roles_unchanged(repo: InterviewRepository, interview_db_id: int, roles: dict[str, str]) -> bool:
+    """Совпадают ли роли из листа с сохранёнными в interview_speaker и turn."""
+    stored = repo.speaker_role_snapshot(interview_db_id)
+    if not stored:
+        return False
+    if any(stored.get(label) != role for label, role in roles.items()):
+        return False
+    turn_roles = repo.turn_roles_by_label(interview_db_id)
+    return all(turn_roles.get(label, set()) == {role} for label, role in roles.items())
+
+
+def _check_respondent(
+    repo: InterviewRepository,
+    interview_db_id: int,
+    roles: dict[str, str],
+    interview_id: str,
+) -> None:
+    """У интервью должен остаться хотя бы один респондент.
+
+    Лист может содержать не все метки, поэтому проверяется итоговый набор:
+    сохранённые роли плюс роли из листа.
+    """
+    effective = {**repo.speaker_role_snapshot(interview_db_id), **roles}
+    if not any(role == "RESPONDENT" for role in effective.values()):
+        msg = (
+            f"Интервью {interview_id}: ни одной роли RESPONDENT ни в листе «Роли_говорящих»,"
+            " ни в БД. Роли не применены, БД не изменена"
         )
         raise SpeakerRolesError(msg)
 
@@ -119,6 +175,9 @@ def apply_speaker_roles(
 ) -> SpeakerRolesResult:
     """Применить роли из листа «Роли_говорящих» к записям и репликам интервью.
 
+    Если роли совпадают с сохранёнными в `interview_speaker` и `turn`, ничего не меняется
+    и реплики не пересобираются: повторный `load-project` не должен трогать данные.
+
     Args:
         conn: подключение к SQLite (миграции уже применены).
         interview_id: внешний идентификатор интервью (`id_интервью`).
@@ -128,7 +187,7 @@ def apply_speaker_roles(
         groups: канонические значения групп.
 
     Raises:
-        SpeakerRolesError: ссылки new_term мешают пересборке реплик.
+        SpeakerRolesError: нет меток, нет RESPONDENT или пересборка потеряет ссылки.
         ValueError: неизвестная роль.
     """
     invalid = {label: role for label, role in roles.items() if role not in ROLES}
@@ -148,6 +207,14 @@ def apply_speaker_roles(
 
     if not roles:
         result.notes.append(f"Интервью {interview_id}: в листе «Роли_говорящих» нет строк, роли не менялись")
+        return result
+
+    _check_labels_complete(repo, interview_db_id, interview_id)
+    _check_respondent(repo, interview_db_id, roles, interview_id)
+
+    if _roles_unchanged(repo, interview_db_id, roles):
+        result.roles_unchanged = True
+        result.notes.append(f"Интервью {interview_id}: роли совпадают с сохранёнными, изменения не нужны")
         return result
 
     _check_rebuild_allowed(repo, interview_db_id, interview_id)

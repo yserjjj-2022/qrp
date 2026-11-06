@@ -199,6 +199,7 @@ class TestLoadProjectAppliesRoles:
         path = build_workbook(tmp_path / "book.xlsx")
         load_codebook(db, path, settings.workbook, groups=settings.groups)
         load_project(db, path, settings.workbook, groups=settings.groups)
+        first_version = db.execute("SELECT MAX(id) FROM workbook_version").fetchone()[0]
 
         # Правка листа меняет хеш файла, но не кодбук: load-project должен пройти.
         edited = build_workbook(
@@ -213,3 +214,126 @@ class TestLoadProjectAppliesRoles:
             pipeline=PipelineSettings(),
         )
         assert result.counts["interviews"] == 1
+        # Новый file_hash — новая строка версии книги, кодбук остаётся прежним.
+        assert result.workbook_version_id != first_version
+        assert db.execute("SELECT COUNT(*) FROM codebook_version").fetchone()[0] == 1
+        new_version = db.execute(
+            "SELECT codebook_hash FROM workbook_version WHERE id = ?",
+            (result.workbook_version_id,),
+        ).fetchone()[0]
+        codebook_hash = db.execute("SELECT codebook_hash FROM codebook_version LIMIT 1").fetchone()[0]
+        assert new_version == codebook_hash
+
+
+class TestUnchangedRoles:
+    """Совпадающие роли не приводят к пересборке реплик."""
+
+    def test_same_roles_skip_rebuild(self, db: sqlite3.Connection, transcript: Path, settings: Settings) -> None:
+        _load(db, transcript, settings)
+        roles = _roles(db)
+        utterance_ids = [row[0] for row in db.execute("SELECT id FROM utterance ORDER BY id")]
+
+        result = apply_speaker_roles(db, "R01", roles, settings.pipeline, transcript_path=transcript)
+        db.commit()
+
+        assert result.roles_unchanged is True
+        assert result.utterances_rebuilt == 0
+        assert result.turns_updated == 0
+        assert [row[0] for row in db.execute("SELECT id FROM utterance ORDER BY id")] == utterance_ids
+
+    def test_same_roles_do_not_touch_turns(self, db: sqlite3.Connection, transcript: Path, settings: Settings) -> None:
+        _load(db, transcript, settings)
+        roles = _roles(db)
+        before = db.execute("SELECT id, speaker_role FROM turn ORDER BY id").fetchall()
+
+        apply_speaker_roles(db, "R01", roles, settings.pipeline, transcript_path=transcript)
+        db.commit()
+
+        assert db.execute("SELECT id, speaker_role FROM turn ORDER BY id").fetchall() == before
+
+
+class TestRebuildBlockers:
+    """Пересборка реплик блокируется любыми ссылками на них."""
+
+    def test_golden_sample_blocks(self, db: sqlite3.Connection, transcript: Path, settings: Settings) -> None:
+        _load(db, transcript, settings)
+        utterance_id = db.execute("SELECT id FROM utterance ORDER BY id LIMIT 1").fetchone()[0]
+        db.execute(
+            "INSERT INTO golden_sample (interview_code, utterance_ref, text_l1) VALUES (?, ?, ?)",
+            ("R01", f"utterance:{utterance_id}", "текст"),
+        )
+        db.commit()
+
+        with pytest.raises(SpeakerRolesError, match="golden_sample"):
+            apply_speaker_roles(db, "R01", {"A": "OBSERVER"}, settings.pipeline, transcript_path=transcript)
+
+    def test_annotation_blocks(self, db: sqlite3.Connection, tmp_path: Path, settings: Settings) -> None:
+        path = build_workbook(tmp_path / "book.xlsx")
+        load_codebook(db, path, settings.workbook, groups=settings.groups)
+        transcript = tmp_path / "R01.txt"
+        transcript.write_text(_TRANSCRIPT, encoding="utf-8")
+        _load(db, transcript, settings)
+
+        turn_id = db.execute("SELECT id FROM turn ORDER BY id LIMIT 1").fetchone()[0]
+        code_id = db.execute("SELECT id FROM code LIMIT 1").fetchone()[0]
+        cursor = db.execute(
+            "INSERT INTO fragment (turn_id, text) VALUES (?, ?)",
+            (turn_id, "фрагмент"),
+        )
+        fragment_id = cursor.lastrowid
+        db.execute(
+            "INSERT INTO annotation (fragment_id, code_id, source, quote, status) VALUES (?, ?, ?, ?, ?)",
+            (fragment_id, code_id, "human", "фрагмент", "proposed"),
+        )
+        db.commit()
+
+        with pytest.raises(SpeakerRolesError, match="аннотации"):
+            apply_speaker_roles(db, "R01", {"A": "OBSERVER"}, settings.pipeline, transcript_path=transcript)
+
+    def test_text_unit_blocks(self, db: sqlite3.Connection, transcript: Path, settings: Settings) -> None:
+        _load(db, transcript, settings)
+        # text_unit появляется только в M1b: создаём минимальную таблицу, чтобы
+        # проверить блокировку заранее, а не после миграции 0005.
+        db.execute("CREATE TABLE text_unit (id INTEGER PRIMARY KEY, utterance_id INTEGER REFERENCES utterance(id))")
+        utterance_id = db.execute("SELECT id FROM utterance ORDER BY id LIMIT 1").fetchone()[0]
+        db.execute("INSERT INTO text_unit (utterance_id) VALUES (?)", (utterance_id,))
+        db.commit()
+
+        with pytest.raises(SpeakerRolesError, match="text_unit"):
+            apply_speaker_roles(db, "R01", {"A": "OBSERVER"}, settings.pipeline, transcript_path=transcript)
+
+
+class TestRoleGuards:
+    """Проверки ролей: отсутствие RESPONDENT и незаполненные метки."""
+
+    def test_no_respondent_rejected(self, db: sqlite3.Connection, transcript: Path, settings: Settings) -> None:
+        _load(db, transcript, settings)
+        with pytest.raises(SpeakerRolesError, match="RESPONDENT"):
+            apply_speaker_roles(
+                db,
+                "R01",
+                {"A": "INTERVIEWER", "Б": "OBSERVER"},
+                settings.pipeline,
+                transcript_path=transcript,
+            )
+
+    def test_missing_labels_abort(self, db: sqlite3.Connection, transcript: Path, settings: Settings) -> None:
+        _load(db, transcript, settings)
+        db.execute("UPDATE turn SET speaker_label = NULL")
+        db.commit()
+
+        with pytest.raises(SpeakerRolesError, match="нет метки говорящего"):
+            apply_speaker_roles(db, "R01", {"A": "OBSERVER"}, settings.pipeline, transcript_path=None)
+
+    def test_aborted_apply_leaves_db_unchanged(
+        self, db: sqlite3.Connection, transcript: Path, settings: Settings
+    ) -> None:
+        _load(db, transcript, settings)
+        db.execute("UPDATE turn SET speaker_label = NULL")
+        db.commit()
+        before = _roles(db)
+
+        with pytest.raises(SpeakerRolesError):
+            apply_speaker_roles(db, "R01", {"A": "OBSERVER"}, settings.pipeline, transcript_path=None)
+
+        assert _roles(db) == before

@@ -51,14 +51,15 @@ def _text(row: dict[str, Any], key: str) -> str | None:
     return None if value is None else str(value)
 
 
-def _role_value(value: str, interview_id: str, result: LoadProjectResult) -> str:
-    """Роль говорящего в каноническом виде; неизвестная роль не пишется."""
+def _role_value(value: str, interview_id: str, result: LoadProjectResult) -> str | None:
+    """Роль говорящего в каноническом виде; неизвестная роль не пишется (None)."""
     role = value.strip().upper()
     if role not in ROLES:
         result.discrepancies.append(
-            f"Роли_говорящих: интервью '{interview_id}', роль {value!r} не распознана (допустимы: {sorted(ROLES)})"
+            f"Роли_говорящих: интервью '{interview_id}', роль {value!r} не распознана"
+            f" (допустимы: {sorted(ROLES)}) — строка пропущена"
         )
-        return value
+        return None
     return role
 
 
@@ -190,6 +191,8 @@ def _load_interviews(
                 )
                 continue
             role = _role_value(role, interview_id, result)
+            if role is None:
+                continue
             words = row.get("words")
             speakers.add_speaker(int(existing["id"]), label, role, int(words) if isinstance(words, int) else 0)
             roles_by_interview.setdefault(interview_id, {})[label] = role
@@ -342,18 +345,16 @@ def load_project(
     workbook = read_workbook(workbook_path, workbook_settings)
     workbook_repo = WorkbookRepository(conn)
     codebook_repo = CodebookRepository(conn, groups)
-    # Правка листа «Роли_говорящих» меняет хеш файла, но не кодбук: версию ищем
-    # по хешу кодбуковых листов, иначе каждая правка роли требовала бы load-codebook.
+    # Правка необязательного листа меняет хеш файла, но не кодбук: версию книги ищем
+    # по file_hash, а при промахе — по codebook_hash. Найденный кодбук подтверждает,
+    # что книга уже загружалась, поэтому для нового file_hash пишется новая строка
+    # workbook_version: иначе каждая правка роли требовала бы load-codebook.
     workbook_version_id = workbook_repo.find_by_hash(workbook.file_hash)
     if workbook_version_id is None:
         codebook_version_id = codebook_repo.find_by_codebook_hash(workbook.codebook_hash)
         if codebook_version_id is not None:
-            row = conn.execute(
-                "SELECT workbook_version_id FROM codebook_version WHERE id = ?",
-                (codebook_version_id,),
-            ).fetchone()
-            if row is not None:
-                workbook_version_id = int(row[0])
+            workbook_version_id = workbook_repo.insert(workbook)
+            logger.info("Новая версия книги при том же кодбуке: workbook_version_id=%s", workbook_version_id)
     if workbook_version_id is None:
         msg = f"Книга {workbook_path} ещё не загружена командой load-codebook; сначала загрузите кодбук, затем проект"
         raise RuntimeError(msg)

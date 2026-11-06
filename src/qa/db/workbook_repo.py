@@ -552,6 +552,83 @@ class InterviewRepository:
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
+    def _table_exists(self, name: str) -> bool:
+        """Есть ли таблица в схеме (text_unit появляется только в M1b)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    def utterance_ids(self, interview_db_id: int) -> list[int]:
+        """Идентификаторы реплик интервью."""
+        rows = self._conn.execute(
+            "SELECT id FROM utterance WHERE interview_id = ? ORDER BY id",
+            (interview_db_id,),
+        ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def golden_refs_on_utterances(self, interview_db_id: int) -> int:
+        """Сколько записей золотого набора ссылается на реплики интервью (utterance:<id>)."""
+        rows = self._conn.execute("SELECT utterance_ref FROM golden_sample WHERE utterance_ref IS NOT NULL").fetchall()
+        ids = set(self.utterance_ids(interview_db_id))
+        linked = 0
+        for (ref,) in rows:
+            prefix, _, value = str(ref).partition(":")
+            if prefix != "utterance" or not value.isdigit():
+                continue
+            if int(value) in ids:
+                linked += 1
+        return linked
+
+    def text_unit_refs_on_utterances(self, interview_db_id: int) -> int:
+        """Сколько единиц L2 ссылается на реплики интервью (таблица появляется в M1b)."""
+        if not self._table_exists("text_unit"):
+            return 0
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM text_unit t JOIN utterance u ON t.utterance_id = u.id WHERE u.interview_id = ?",
+            (interview_db_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def annotation_refs_on_turns(self, interview_db_id: int) -> int:
+        """Сколько аннотаций ссылается на фрагменты записей интервью."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM annotation a"
+            " JOIN fragment f ON a.fragment_id = f.id"
+            " JOIN turn t ON f.turn_id = t.id"
+            " WHERE t.interview_id = ?",
+            (interview_db_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def speaker_role_snapshot(self, interview_db_id: int) -> dict[str, str]:
+        """Сохранённые роли: карта «метка говорящего -> роль»."""
+        rows = self._conn.execute(
+            "SELECT speaker_label, role FROM interview_speaker WHERE interview_id = ?",
+            (interview_db_id,),
+        ).fetchall()
+        return {str(label): str(role) for label, role in rows}
+
+    def turn_roles_by_label(self, interview_db_id: int) -> dict[str, set[str]]:
+        """Роли записей по меткам: карта «метка -> множество ролей»."""
+        rows = self._conn.execute(
+            "SELECT speaker_label, speaker_role FROM turn WHERE interview_id = ? AND speaker_label IS NOT NULL",
+            (interview_db_id,),
+        ).fetchall()
+        result: dict[str, set[str]] = {}
+        for label, role in rows:
+            result.setdefault(str(label), set()).add(str(role))
+        return result
+
+    def count_turns_without_label(self, interview_db_id: int) -> int:
+        """Сколько записей интервью осталось без метки говорящего."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM turn WHERE interview_id = ? AND speaker_label IS NULL",
+            (interview_db_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
 
 class NewTermRepository:
     """Кандидаты новых терминов для review-terms (M1b)."""
