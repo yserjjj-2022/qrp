@@ -34,6 +34,11 @@ _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 class _ResponseFormatUnsupportedError(Exception):
     """Эндпоинт отверг response_format json_schema; нужен повтор без него."""
 
+    def __init__(self, status: int, reason: str) -> None:
+        self.status = status
+        self.reason = reason
+        super().__init__(f"HTTP {status}{f' ({reason})' if reason else ''}")
+
 
 class OpenAICompatibleProvider(LlmProvider):
     """Провайдер OpenAI-совместимого API (chat/completions и embeddings)."""
@@ -186,11 +191,16 @@ class OpenAICompatibleProvider(LlmProvider):
         payload = self._build_payload(prompt, schema, params, use_response_format)
         try:
             return self._post("/chat/completions", payload)
-        except _ResponseFormatUnsupportedError:
+        except _ResponseFormatUnsupportedError as exc:
             if not use_response_format:
-                raise
+                msg = f"LLM-эндпоинт отверг запрос: {exc.reason or exc.status}"
+                raise LlmRequestError(msg) from None
             self._supports_response_format = False
-            logger.info("LLM: response_format json_schema не поддержан, повтор без него")
+            logger.info(
+                "LLM: response_format json_schema не поддержан (status=%d reason=%s), повтор без него",
+                exc.status,
+                exc.reason or "—",
+            )
             payload = self._build_payload(prompt, schema, params, False)
             return self._post("/chat/completions", payload)
 
@@ -218,6 +228,10 @@ class OpenAICompatibleProvider(LlmProvider):
             except HTTPError as exc:
                 status = int(exc.code)
                 raw = b""
+                try:
+                    raw = exc.read()
+                except OSError:
+                    raw = b""
                 exc.close()
             except (URLError, TimeoutError) as exc:
                 logger.warning("LLM: сеть недоступна, попытка %d из %d", attempt, _TRANSPORT_ATTEMPTS)
@@ -238,13 +252,56 @@ class OpenAICompatibleProvider(LlmProvider):
                     self._sleep(_BACKOFF_BASE * 2 ** (attempt - 1))
                     continue
                 break
-            if status in (400, 422) and use_response_format:
-                raise _ResponseFormatUnsupportedError
-            msg = f"LLM-эндпоинт вернул HTTP {status}"
+            reason = _error_reason(raw)
+            if reason:
+                logger.warning("LLM HTTP: status=%d reason=%s", status, reason)
+            if status in (400, 422) and use_response_format and _mentions_response_format(raw):
+                raise _ResponseFormatUnsupportedError(status, reason)
+            msg = f"LLM-эндпоинт вернул HTTP {status}{f' ({reason})' if reason else ''}"
             raise LlmRequestError(msg)
 
         msg = f"LLM-эндпоинт недоступен после {_TRANSPORT_ATTEMPTS} попыток (HTTP {last_status})"
         raise LlmRequestError(msg)
+
+
+def _error_body(raw: bytes) -> dict[str, Any]:
+    """Тело ошибки API, если это JSON-объект."""
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _error_reason(raw: bytes) -> str:
+    """Тип и код ошибки из тела ответа.
+
+    Возвращается только машинная диагностика (`error.type`, `error.code`,
+    `error.param`): текст сообщения модели и запроса не логируется.
+    """
+    error = _error_body(raw).get("error")
+    if not isinstance(error, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("type", "code", "param"):
+        value = error.get(key)
+        if isinstance(value, str) and value:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
+def _mentions_response_format(raw: bytes) -> bool:
+    """Похоже ли, что эндпоинт отверг именно response_format.
+
+    Смотрим на структурные поля тела ошибки; свободный текст не используется,
+    чтобы не путать отказ по имени модели с отказом по формату ответа.
+    """
+    error = _error_body(raw).get("error")
+    if not isinstance(error, dict):
+        return False
+    fields = [error.get(key) for key in ("type", "code", "param")]
+    joined = " ".join(value for value in fields if isinstance(value, str)).lower()
+    return "response_format" in joined or "json_schema" in joined
 
 
 def _hash(value: str) -> str:

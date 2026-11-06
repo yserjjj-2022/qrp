@@ -143,16 +143,44 @@ class TestCompleteJson:
 
     def test_falls_back_when_response_format_rejected(self, server: tuple[str, _ServerState]) -> None:
         endpoint, state = server
-        state.responses = [(400, {"error": "unsupported response_format"}), (200, _ok_envelope())]
+        state.responses = [
+            (400, {"error": {"type": "invalid_request_error", "param": "response_format"}}),
+            (200, _ok_envelope()),
+        ]
         result = _provider(endpoint).complete_json_detailed(_PROMPT, _SCHEMA)
         assert result.data == {"ok": True}
         assert len(state.requests) == 2
         assert "response_format" in state.requests[0]
         assert "response_format" not in state.requests[1]
 
+    def test_bad_request_with_other_reason_is_not_retried(self, server: tuple[str, _ServerState]) -> None:
+        """400 по другой причине не маскируется под отказ response_format."""
+        endpoint, state = server
+        state.responses = [(400, {"error": {"type": "invalid_request_error", "code": "model_not_found"}})]
+        with pytest.raises(LlmRequestError) as exc_info:
+            _provider(endpoint).complete_json(_PROMPT, _SCHEMA)
+        assert len(state.requests) == 1
+        assert "model_not_found" in str(exc_info.value)
+        assert "response_format" in state.requests[0]
+
+    def test_error_text_is_not_logged(self, server: tuple[str, _ServerState], caplog: pytest.LogCaptureFixture) -> None:
+        """Тело ошибки не попадает в логи: только машинные поля."""
+        endpoint, _state = server
+        secret_text = "внутренний-текст-запроса"
+        server_state = _state
+        server_state.responses = [(400, {"error": {"type": "invalid_request_error", "message": secret_text}})]
+        with caplog.at_level("DEBUG"), pytest.raises(LlmRequestError):
+            _provider(endpoint).complete_json(_PROMPT, _SCHEMA)
+        assert secret_text not in caplog.text
+        assert "invalid_request_error" in caplog.text
+
     def test_response_format_not_retried_after_success(self, server: tuple[str, _ServerState]) -> None:
         endpoint, state = server
-        state.responses = [(400, {}), (200, _ok_envelope()), (200, _ok_envelope())]
+        state.responses = [
+            (400, {"error": {"code": "unknown_parameter", "param": "response_format"}}),
+            (200, _ok_envelope()),
+            (200, _ok_envelope()),
+        ]
         provider = _provider(endpoint)
         provider.complete_json_detailed(_PROMPT, _SCHEMA)
         provider.complete_json_detailed(_PROMPT + "2", _SCHEMA)
