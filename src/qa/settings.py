@@ -12,9 +12,24 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 ColumnType = Literal["str", "text", "int", "date", "list", "notes"]
 ListKind = Literal["code", "question", "plain"]
 
+LLM_PROVIDERS: tuple[str, ...] = ("stub", "openai_compatible")
+
+LLM_ENV_FIELDS: dict[str, str] = {
+    "LLM_PROVIDER": "provider",
+    "LLM_ENDPOINT": "endpoint",
+    "LLM_MODEL": "model",
+    "LLM_MODEL_NORMALIZE": "model_normalize",
+    "LLM_CACHE_DIR": "cache_dir",
+    "LLM_MAX_CALLS_PER_RUN": "max_calls_per_run",
+}
+
 
 class LlmSettings(BaseModel):
-    """Настройки LLM-провайдера."""
+    """Настройки LLM-провайдера.
+
+    Секрет LLM_API_KEY здесь не хранится: он читается из окружения через
+    `Settings.llm_api_key()` и передаётся провайдеру напрямую.
+    """
 
     provider: str = "stub"
     model: str | None = None
@@ -22,6 +37,32 @@ class LlmSettings(BaseModel):
     endpoint: str | None = None
     max_calls_per_run: int = Field(default=100, ge=1)
     cache_dir: str = "data/cache"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_env(cls, data: Any) -> Any:  # noqa: ANN401
+        """Перекрыть значения из config.yaml переменными окружения.
+
+        Переменные окружения приоритетнее файла конфигурации: значения из
+        `.env` задаёт оператор для конкретного запуска.
+        """
+        merged: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
+        for env_name, field_name in LLM_ENV_FIELDS.items():
+            raw = os.environ.get(env_name)
+            if raw is None or not raw.strip():
+                continue
+            merged[field_name] = raw.strip()
+        return merged
+
+    @field_validator("provider")
+    @classmethod
+    def _check_provider(cls, v: str) -> str:
+        """Допустимые значения LLM_PROVIDER."""
+        value = v.strip()
+        if value not in LLM_PROVIDERS:
+            msg = f"Недопустимый LLM_PROVIDER: {value!r}. Допустимы: {', '.join(LLM_PROVIDERS)}"
+            raise ValueError(msg)
+        return value
 
 
 class VectorsSettings(BaseModel):
@@ -247,6 +288,11 @@ class Settings(BaseModel):
                 raise ValueError(msg)
         return v
 
+    def llm_api_key(self) -> str | None:
+        """Ключ LLM из окружения. В модели настроек не хранится."""
+        value = os.environ.get("LLM_API_KEY")
+        return value.strip() if value and value.strip() else None
+
     def ensure_dirs(self) -> None:
         """Создать каталоги данных, если их нет."""
         for value in (
@@ -263,7 +309,11 @@ class Settings(BaseModel):
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> Settings:
-        """Загрузить настройки из config.yaml + переменных окружения."""
+        """Загрузить настройки из config.yaml + переменных окружения.
+
+        `.env` читается вызывающей стороной (`load_env_file`) на входе CLI:
+        библиотечный код не меняет окружение процесса неявно.
+        """
         data: dict[str, Any] = {}
         if config_path is None:
             config_path = Path("config.yaml")
@@ -273,3 +323,32 @@ class Settings(BaseModel):
             if isinstance(raw, dict):
                 data = raw
         return cls(**data)
+
+
+def load_env_file(env_path: Path | None = None) -> None:
+    """Прочитать .env и дополнить os.environ.
+
+    Значения, уже заданные в окружении, не перезаписываются. Секреты не
+    логируются. Формат: KEY=VALUE, строки с # и пустые игнорируются.
+    """
+    path = env_path if env_path is not None else Path(".env")
+    if not path.is_file():
+        return
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, raw_value = stripped.partition("=")
+        name = name.strip()
+        if name.startswith("export "):
+            name = name[len("export ") :].strip()
+        if not name or name in os.environ:
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ[name] = value

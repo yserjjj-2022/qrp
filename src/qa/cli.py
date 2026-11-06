@@ -9,7 +9,13 @@ from pathlib import Path
 from qa.db.connection import get_connection
 from qa.db.migrations import migrate
 from qa.log import setup_logging
-from qa.settings import Settings
+from qa.settings import Settings, load_env_file
+
+
+def _load_settings() -> Settings:
+    """Загрузить .env (если есть) и настройки проекта."""
+    load_env_file()
+    return Settings.load()
 
 
 def _migrations_dir() -> Path:
@@ -54,7 +60,7 @@ def _print_notes(notes: list[str]) -> None:
 
 def cmd_load_codebook(args: argparse.Namespace) -> int:
     """Загрузить обязательные листы книги, темы и словарь замен."""
-    settings = Settings.load()
+    settings = _load_settings()
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.load_codebook import load_codebook
 
@@ -84,7 +90,7 @@ def cmd_load_codebook(args: argparse.Namespace) -> int:
 
 def cmd_load_project(args: argparse.Namespace) -> int:
     """Загрузить необязательные листы проекта и умолчания."""
-    settings = Settings.load()
+    settings = _load_settings()
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.load_project import load_project
 
@@ -110,7 +116,7 @@ def cmd_load_project(args: argparse.Namespace) -> int:
 
 def cmd_init_interview(args: argparse.Namespace) -> int:
     """Определить говорящих, показать роли, подтвердить и записать интервью."""
-    settings = Settings.load()
+    settings = _load_settings()
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.init_interview import apply_plan, build_plan, create_names_map_skeleton, render_plan
 
@@ -137,7 +143,7 @@ def cmd_init_interview(args: argparse.Namespace) -> int:
 
 def cmd_load_transcript(args: argparse.Namespace) -> int:
     """Загрузить транскрипт интервью (M1a)."""
-    settings = Settings.load()
+    settings = _load_settings()
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.init_interview import build_plan, plan_to_meta, resolve_names_map
     from qa.pipeline.load_transcript import build_replacement_map, load_meta, load_transcript
@@ -174,7 +180,7 @@ def cmd_load_transcript(args: argparse.Namespace) -> int:
 
 def cmd_review_terms(args: argparse.Namespace) -> int:
     """Интерактивно утвердить или отклонить кандидатов new_term."""
-    settings = Settings.load()
+    settings = _load_settings()
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.review_terms import review_terms
 
@@ -192,7 +198,7 @@ def cmd_review_terms(args: argparse.Namespace) -> int:
 
 def cmd_export_golden_sample(args: argparse.Namespace) -> int:
     """Выгрузить реплики L1 в xlsx для ручной нормализации."""
-    settings = Settings.load()
+    settings = _load_settings()
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.golden import GOLDEN_FILENAME, export_golden_sample
 
@@ -208,7 +214,7 @@ def cmd_export_golden_sample(args: argparse.Namespace) -> int:
 
 def cmd_import_golden(args: argparse.Namespace) -> int:
     """Загрузить заполненный золотой набор (файл или лист книги)."""
-    settings = Settings.load()
+    settings = _load_settings()
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.golden import GOLDEN_FILENAME, import_golden
 
@@ -220,6 +226,56 @@ def cmd_import_golden(args: argparse.Namespace) -> int:
         conn.close()
     print(f"[{run_id}] золотой набор импортирован: строк={result.n_rows}, с L2={result.n_filled}")
     return 0
+
+
+def cmd_llm_ping(args: argparse.Namespace) -> int:
+    """Проверить эндпоинт и модель на синтетическом запросе."""
+    from pydantic import ValidationError
+
+    from qa.llm.errors import LlmError
+    from qa.llm.ping import dry_run_llm, ping_llm
+
+    try:
+        settings = _load_settings()
+    except ValidationError as exc:
+        print(f"llm-ping: ошибка настроек — {_settings_error_summary(exc)}")
+        return 1
+    run_id = setup_logging(settings.log_level)
+    try:
+        outcome = (
+            dry_run_llm(settings, normalize=args.normalize)
+            if args.dry_run
+            else ping_llm(settings, normalize=args.normalize)
+        )
+    except LlmError as exc:
+        print(f"[{run_id}] llm-ping: ошибка — {exc}")
+        return 1
+    if args.dry_run:
+        print(
+            f"[{run_id}] llm-ping dry-run: провайдер={settings.llm.provider}, "
+            f"модель={outcome.model_requested or '—'}, вызовов=1, "
+            f"оценка токенов промпта={outcome.prompt_tokens}, отправлено=0"
+        )
+        return 0
+    print(
+        f"[{run_id}] llm-ping: model_used={outcome.model_used}, "
+        f"prompt_tokens={outcome.prompt_tokens}, completion_tokens={outcome.completion_tokens}, "
+        f"время={outcome.elapsed_ms:.0f} мс, кэш={'да' if outcome.cached else 'нет'}"
+    )
+    if not outcome.ok:
+        print(f"[{run_id}] llm-ping: ответ модели не содержит ok=true")
+        return 1
+    return 0
+
+
+def _settings_error_summary(exc: Exception) -> str:
+    """Краткий текст ошибки настроек без значений полей."""
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        messages = [str(error.get("msg", "")) for error in exc.errors()]
+        return "; ".join(message for message in messages if message) or "некорректные настройки"
+    return "некорректные настройки"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -263,6 +319,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_import = subparsers.add_parser("import-golden", help="Загрузить заполненный золотой набор")
     p_import.add_argument("file", nargs="?", help="Путь к xlsx; по умолчанию data/golden/golden_sample.xlsx")
     p_import.set_defaults(func=cmd_import_golden)
+
+    p_ping = subparsers.add_parser("llm-ping", help="Проверить LLM-эндпоинт на синтетическом запросе")
+    p_ping.add_argument("--normalize", action="store_true", help="Использовать LLM_MODEL_NORMALIZE")
+    p_ping.add_argument("--dry-run", action="store_true", help="Показать объём вызова без отправки")
+    p_ping.set_defaults(func=cmd_llm_ping)
 
     return parser
 
