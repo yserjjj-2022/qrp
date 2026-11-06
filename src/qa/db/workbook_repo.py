@@ -476,6 +476,82 @@ class InterviewRepository:
         ).fetchall()
         return [(str(label), str(role), int(words)) for label, role, words in rows]
 
+    def update_speaker_role(self, interview_db_id: int, label: str, role: str) -> int:
+        """Сменить роль говорящего; вернуть число изменённых строк."""
+        cursor = self._conn.execute(
+            "UPDATE interview_speaker SET role = ? WHERE interview_id = ? AND speaker_label = ?",
+            (role, interview_db_id, label),
+        )
+        return int(cursor.rowcount)
+
+    def turn_line_labels(self, interview_db_id: int) -> list[tuple[int, str | None]]:
+        """Номера строк и метки говорящих в записях интервью."""
+        rows = self._conn.execute(
+            "SELECT line_no, speaker_label FROM turn WHERE interview_id = ? ORDER BY line_no",
+            (interview_db_id,),
+        ).fetchall()
+        return [(int(line_no), None if label is None else str(label)) for line_no, label in rows]
+
+    def fill_turn_labels(self, interview_db_id: int, labels_by_line: dict[int, str]) -> int:
+        """Заполнить метки говорящих в записях интервью; вернуть число строк."""
+        changed = 0
+        for line_no, label in labels_by_line.items():
+            cursor = self._conn.execute(
+                "UPDATE turn SET speaker_label = ? WHERE interview_id = ? AND line_no = ?",
+                (label, interview_db_id, line_no),
+            )
+            changed += int(cursor.rowcount)
+        return changed
+
+    def update_turn_roles(self, interview_db_id: int, label: str, role: str) -> int:
+        """Сменить роль записей одного говорящего; вернуть число изменённых строк."""
+        cursor = self._conn.execute(
+            "UPDATE turn SET speaker_role = ? WHERE interview_id = ? AND speaker_label = ?",
+            (role, interview_db_id, label),
+        )
+        return int(cursor.rowcount)
+
+    def turns_for_utterances(self, interview_db_id: int) -> list[tuple[int, str, str]]:
+        """Записи интервью в порядке транскрипта: (id, роль, текст)."""
+        rows = self._conn.execute(
+            "SELECT id, speaker_role, text FROM turn WHERE interview_id = ? ORDER BY line_no, id",
+            (interview_db_id,),
+        ).fetchall()
+        return [(int(turn_id), str(role), str(text)) for turn_id, role, text in rows]
+
+    def clear_utterances(self, interview_db_id: int) -> int:
+        """Удалить реплики интервью перед пересборкой; вернуть число строк."""
+        cursor = self._conn.execute("DELETE FROM utterance WHERE interview_id = ?", (interview_db_id,))
+        return int(cursor.rowcount)
+
+    def insert_utterance(
+        self,
+        interview_db_id: int,
+        speaker_role: str,
+        text: str,
+        turn_ids: list[int],
+        is_backchannel: bool,
+    ) -> int:
+        """Записать реплику."""
+        cursor = self._conn.execute(
+            "INSERT INTO utterance (interview_id, speaker_role, text, turn_ids, is_backchannel) VALUES (?, ?, ?, ?, ?)",
+            (interview_db_id, speaker_role, text, json.dumps(turn_ids), int(is_backchannel)),
+        )
+        new_id = cursor.lastrowid
+        if new_id is None:
+            msg = "SQLite не вернул id вставленной строки utterance"
+            raise sqlite3.Error(msg)
+        return int(new_id)
+
+    def new_terms_on_utterances(self, interview_db_id: int) -> int:
+        """Сколько кандидатов новых терминов ссылается на реплики интервью."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM new_term n JOIN utterance u ON n.context_utterance_id = u.id"
+            " WHERE u.interview_id = ?",
+            (interview_db_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
 
 class NewTermRepository:
     """Кандидаты новых терминов для review-terms (M1b)."""

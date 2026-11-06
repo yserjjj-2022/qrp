@@ -96,6 +96,8 @@ def cmd_load_project(args: argparse.Namespace) -> int:
             settings.workbook,
             groups=settings.groups,
             lexicon_status_map=settings.lexicon_status_map,
+            pipeline=settings.pipeline,
+            transcripts_dir=Path(settings.paths.transcripts),
         )
     finally:
         conn.close()

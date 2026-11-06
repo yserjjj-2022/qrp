@@ -73,7 +73,7 @@ class TestMigrations:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(interview)").fetchall()}
         assert {"respondent_code", "group", "transcript_source", "interview_date"} <= cols
         turn_cols = {row[1] for row in conn.execute("PRAGMA table_info(turn)").fetchall()}
-        assert {"line_no", "start_sec", "speaker_role", "pii_flag"} <= turn_cols
+        assert {"line_no", "start_sec", "speaker_role", "pii_flag", "speaker_label"} <= turn_cols
         code_cols = {row[1] for row in conn.execute("PRAGMA table_info(code)").fetchall()}
         assert {"kind", "title", "tiebreak_rule"} <= code_cols
 

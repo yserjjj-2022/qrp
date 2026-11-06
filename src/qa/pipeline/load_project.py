@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from qa.db.workbook_repo import (
+    CodebookRepository,
     GoldenRepository,
     InterviewRepository,
     LexiconRepository,
@@ -20,8 +21,10 @@ from qa.db.workbook_repo import (
     ReferenceFactRepository,
     WorkbookRepository,
 )
+from qa.pipeline.load_transcript import ROLES
+from qa.pipeline.speaker_roles import SpeakerRolesError, apply_speaker_roles, backfill_speaker_labels
 from qa.pipeline.workbook import WorkbookData, read_workbook
-from qa.settings import GroupsSettings, WorkbookSettings, normalize_lexicon_status
+from qa.settings import GroupsSettings, PipelineSettings, WorkbookSettings, normalize_lexicon_status
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,17 @@ def _text(row: dict[str, Any], key: str) -> str | None:
     """Строковое значение поля строки."""
     value = row.get(key)
     return None if value is None else str(value)
+
+
+def _role_value(value: str, interview_id: str, result: LoadProjectResult) -> str:
+    """Роль говорящего в каноническом виде; неизвестная роль не пишется."""
+    role = value.strip().upper()
+    if role not in ROLES:
+        result.discrepancies.append(
+            f"Роли_говорящих: интервью '{interview_id}', роль {value!r} не распознана (допустимы: {sorted(ROLES)})"
+        )
+        return value
+    return role
 
 
 def _list(row: dict[str, Any], key: str) -> list[str]:
@@ -124,8 +138,13 @@ def _load_interviews(
     interviews: InterviewRepository,
     speakers: InterviewRepository,
     result: LoadProjectResult,
-) -> None:
-    """Загрузить метаданные интервью и роли говорящих из книги."""
+) -> dict[str, dict[str, str]]:
+    """Загрузить метаданные интервью и роли говорящих из книги.
+
+    Returns:
+        Карта «id_интервью -> {метка говорящего: роль}» для применения к записям.
+    """
+    roles_by_interview: dict[str, dict[str, str]] = {}
     sheet = workbook.sheet(SHEET_INTERVIEWS)
     if sheet is not None and not sheet.is_empty:
         for row in sheet.rows:
@@ -170,11 +189,90 @@ def _load_interviews(
                     f"Роли_говорящих: интервью '{interview_id}' нет в листе «Интервью» — строка пропущена"
                 )
                 continue
+            role = _role_value(role, interview_id, result)
             words = row.get("words")
             speakers.add_speaker(int(existing["id"]), label, role, int(words) if isinstance(words, int) else 0)
+            roles_by_interview.setdefault(interview_id, {})[label] = role
             result.counts["speakers"] = result.counts.get("speakers", 0) + 1
     else:
         result.missing_sheets.append(SHEET_SPEAKERS)
+    return roles_by_interview
+
+
+def _transcript_path(workbook: WorkbookData, interview_id: str, transcripts_dir: Path | None) -> Path | None:
+    """Путь к транскрипту интервью по колонке «файл_транскрипта» листа «Интервью»."""
+    if transcripts_dir is None:
+        return None
+    sheet = workbook.sheet(SHEET_INTERVIEWS)
+    for row in sheet.rows if sheet is not None else []:
+        if _text(row, "interview_id") != interview_id:
+            continue
+        file_name = _text(row, "transcript_file")
+        if not file_name:
+            return None
+        return Path(transcripts_dir) / file_name
+    return None
+
+
+def _apply_roles(
+    conn: sqlite3.Connection,
+    workbook: WorkbookData,
+    roles_by_interview: dict[str, dict[str, str]],
+    result: LoadProjectResult,
+    *,
+    pipeline: PipelineSettings,
+    transcripts_dir: Path | None,
+    groups: GroupsSettings | None,
+) -> None:
+    """Довести роли из листа до записей turn и реплик utterance."""
+    for interview_id, roles in roles_by_interview.items():
+        transcript = _transcript_path(workbook, interview_id, transcripts_dir)
+        try:
+            applied = apply_speaker_roles(
+                conn,
+                interview_id,
+                roles,
+                pipeline,
+                transcript_path=transcript,
+                groups=groups,
+            )
+        except SpeakerRolesError as exc:
+            result.discrepancies.append(str(exc))
+            continue
+        result.counts["speaker_roles_applied"] = result.counts.get("speaker_roles_applied", 0) + 1
+        result.counts["utterances_rebuilt"] = result.counts.get("utterances_rebuilt", 0) + applied.utterances_rebuilt
+        result.discrepancies.extend(applied.notes)
+        logger.info(
+            "Роли применены: %s, записей=%s, реплик=%s",
+            interview_id,
+            applied.turns_updated,
+            applied.utterances_rebuilt,
+        )
+
+
+def _backfill_labels(
+    conn: sqlite3.Connection,
+    workbook: WorkbookData,
+    result: LoadProjectResult,
+    *,
+    transcripts_dir: Path | None,
+    groups: GroupsSettings | None,
+) -> None:
+    """Заполнить метки говорящих в записях, загруженных до миграции 0004.
+
+    Нужно и при пустом листе «Роли_говорящих»: без меток будущая правка роли
+    не сможет дойти до записей, и это осталось бы незамеченным.
+    """
+    sheet = workbook.sheet(SHEET_INTERVIEWS)
+    for row in sheet.rows if sheet is not None else []:
+        interview_id = _text(row, "interview_id")
+        if interview_id is None:
+            continue
+        transcript = _transcript_path(workbook, interview_id, transcripts_dir)
+        filled, notes = backfill_speaker_labels(conn, interview_id, transcript, groups=groups)
+        if filled:
+            result.counts["speaker_labels_filled"] = result.counts.get("speaker_labels_filled", 0) + filled
+        result.discrepancies.extend(notes)
 
 
 def _load_golden(workbook: WorkbookData, repo: GoldenRepository, result: LoadProjectResult) -> None:
@@ -226,12 +324,16 @@ def load_project(
     *,
     groups: GroupsSettings | None = None,
     lexicon_status_map: dict[str, str] | None = None,
+    pipeline: PipelineSettings | None = None,
+    transcripts_dir: Path | None = None,
 ) -> LoadProjectResult:
     """Загрузить необязательные листы проекта и умолчания.
 
     Args:
         groups: канонические значения групп; неизвестное сохраняется с предупреждением.
         lexicon_status_map: приведение статусов лексикона к proposed/approved/rejected.
+        pipeline: настройки сборки реплик; нужны, чтобы применить роли к записям.
+        transcripts_dir: каталог транскриптов; по нему заполняются недостающие метки.
 
     Raises:
         FileNotFoundError: файл не найден.
@@ -239,7 +341,19 @@ def load_project(
     """
     workbook = read_workbook(workbook_path, workbook_settings)
     workbook_repo = WorkbookRepository(conn)
+    codebook_repo = CodebookRepository(conn, groups)
+    # Правка листа «Роли_говорящих» меняет хеш файла, но не кодбук: версию ищем
+    # по хешу кодбуковых листов, иначе каждая правка роли требовала бы load-codebook.
     workbook_version_id = workbook_repo.find_by_hash(workbook.file_hash)
+    if workbook_version_id is None:
+        codebook_version_id = codebook_repo.find_by_codebook_hash(workbook.codebook_hash)
+        if codebook_version_id is not None:
+            row = conn.execute(
+                "SELECT workbook_version_id FROM codebook_version WHERE id = ?",
+                (codebook_version_id,),
+            ).fetchone()
+            if row is not None:
+                workbook_version_id = int(row[0])
     if workbook_version_id is None:
         msg = f"Книга {workbook_path} ещё не загружена командой load-codebook; сначала загрузите кодбук, затем проект"
         raise RuntimeError(msg)
@@ -248,7 +362,18 @@ def load_project(
     _load_lexicon(workbook, LexiconRepository(conn), lexicon_status_map or {}, result)
     _load_markers(workbook, MarkerRepository(conn), workbook_settings, result)
     interviews = InterviewRepository(conn, groups)
-    _load_interviews(workbook, interviews, interviews, result)
+    roles_by_interview = _load_interviews(workbook, interviews, interviews, result)
+    _backfill_labels(conn, workbook, result, transcripts_dir=transcripts_dir, groups=groups)
+    if pipeline is not None and roles_by_interview:
+        _apply_roles(
+            conn,
+            workbook,
+            roles_by_interview,
+            result,
+            pipeline=pipeline,
+            transcripts_dir=transcripts_dir,
+            groups=groups,
+        )
     _load_golden(workbook, GoldenRepository(conn), result)
     _load_facts(workbook, workbook_version_id, ReferenceFactRepository(conn), workbook_settings, result)
     conn.commit()

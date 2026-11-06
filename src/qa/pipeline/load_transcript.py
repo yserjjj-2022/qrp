@@ -475,9 +475,9 @@ def _write_turns(
         role = meta.roles[rec.speaker_label]
         text = pseudonymize(rec.text, replacement_map)
         turn_id_raw = conn.execute(
-            "INSERT INTO turn (interview_id, line_no, start_sec, speaker_role, text, pii_flag)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (interview_id, rec.line_no, rec.start_sec, role, text, int(detect_pii(text))),
+            "INSERT INTO turn (interview_id, line_no, start_sec, speaker_role, speaker_label, text, pii_flag)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (interview_id, rec.line_no, rec.start_sec, role, rec.speaker_label, text, int(detect_pii(text))),
         ).lastrowid
         if turn_id_raw is None:
             msg = f"SQLite не вернул id вставленной строки turn (строка {rec.line_no})"

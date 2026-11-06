@@ -30,6 +30,7 @@
 | line_no | INTEGER NOT NULL | Номер строки в исходном файле (L0) |
 | start_sec | INTEGER NOT NULL | Метка начала реплики в секундах |
 | speaker_role | TEXT NOT NULL | INTERVIEWER / RESPONDENT / OBSERVER |
+| speaker_label | TEXT | Метка говорящего из транскрипта (миграция 0004) |
 | text | TEXT NOT NULL | Текст L1 (псевдонимизированный) |
 | pii_flag | INTEGER NOT NULL DEFAULT 0 | Совпадение с шаблонами PII (на ручную проверку) |
 
@@ -330,6 +331,10 @@
 | role | TEXT NOT NULL | INTERVIEWER / RESPONDENT / OBSERVER |
 | words | INTEGER NOT NULL DEFAULT 0 | Число слов |
 | UNIQUE(interview_id, speaker_label) | | |
+
+Роли из листа «Роли_говорящих» применяются к `turn.speaker_role` и пересобирают `utterance`
+(`load-project`). Пересборка запрещена, если на реплики ссылаются кандидаты `new_term`:
+их ссылки потерялись бы, поэтому сначала закрывается `review-terms`.
 
 ### new_term
 Кандидаты новых терминов для review-terms (используется в M1b).
