@@ -268,6 +268,83 @@ def cmd_llm_ping(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_normalize(args: argparse.Namespace) -> int:
+    """Нормализовать реплики интервью в слой L2."""
+    from qa.llm.errors import LlmConfigError, LlmError
+    from qa.pipeline.normalize import NormalizeError, normalize_interview, plan_dry_run
+    from qa.version import code_version
+
+    settings = _load_settings()
+    run_id = setup_logging(settings.log_level)
+    conn = _open_db(settings)
+    try:
+        if args.dry_run:
+            report = plan_dry_run(conn, args.interview, settings)
+            print(
+                f"[{run_id}] normalize dry-run {report.interview_code}: реплик={report.utterances}, "
+                f"вызовов модели={report.model_calls}, оценка токенов промпта={report.prompt_tokens}, "
+                f"отправлено=0"
+            )
+            if report.already_done:
+                print("  L2 версии 1 уже записан: без --new-version команда ничего не сделает")
+            return 0
+
+        provider = None
+        if settings.llm.provider != "stub":
+            from qa.llm import provider_from_settings
+
+            try:
+                provider = provider_from_settings(settings, normalize=True)
+            except LlmConfigError as exc:
+                print(f"[{run_id}] normalize: ошибка настроек — {exc}")
+                return 1
+
+        version = 1
+        if args.new_version:
+            from qa.db.workbook_repo import InterviewRepository, TextUnitRepository
+
+            interview_db_id = InterviewRepository(conn).interview_db_id_by_code(args.interview)
+            if interview_db_id is not None:
+                version = TextUnitRepository(conn).max_version_for_interview(interview_db_id) + 1
+
+        result = normalize_interview(
+            conn,
+            args.interview,
+            settings,
+            provider,
+            version=version,
+            code_version=code_version(),
+        )
+    except (NormalizeError, LlmError) as exc:
+        print(f"[{run_id}] normalize: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    if result.skipped:
+        print(f"[{run_id}] normalize {result.interview_code}: L2 версии {result.version} уже записан, дублей нет")
+        return 0
+
+    stats = result.stats
+    quality = ", ".join(f"{name}={value}" for name, value in sorted(stats.asr_quality.items())) or "—"
+    rejections = ", ".join(f"{name}={value}" for name, value in sorted(stats.rejections.items())) or "нет"
+    terms = ", ".join(f"{name}={value}" for name, value in sorted(stats.term_replacements.items())) or "нет"
+    print(
+        f"[{run_id}] normalize {result.interview_code} (L2 v{result.version}): реплик={stats.total}, "
+        f"proposed={stats.proposed}, rejected={stats.rejected}, вызовов={stats.model_calls}, "
+        f"модель={result.model_used or '—'}"
+    )
+    print(f"  asr_quality: {quality}")
+    print(
+        f"  паразитов удалено={stats.fillers_removed}, заиканий={stats.stutter_removed}, "
+        f"неясных повторов={stats.repeat_unclear}"
+    )
+    print(f"  замены по лексикону: {terms}")
+    print(f"  отказы автопроверок: {rejections}")
+    print(f"  new_term={stats.new_terms}, токены: prompt={stats.prompt_tokens}, completion={stats.completion_tokens}")
+    return 0
+
+
 def _settings_error_summary(exc: Exception) -> str:
     """Краткий текст ошибки настроек без значений полей."""
     from pydantic import ValidationError
@@ -322,8 +399,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ping = subparsers.add_parser("llm-ping", help="Проверить LLM-эндпоинт на синтетическом запросе")
     p_ping.add_argument("--normalize", action="store_true", help="Использовать LLM_MODEL_NORMALIZE")
-    p_ping.add_argument("--dry-run", action="store_true", help="Показать объём вызова без отправки")
+    p_ping.add_argument("--dry-run", action="store_true", help="Проверить без отправки запроса")
     p_ping.set_defaults(func=cmd_llm_ping)
+
+    p_norm = subparsers.add_parser("normalize", help="Нормализовать реплики интервью в слой L2")
+    p_norm.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_norm.add_argument("--dry-run", action="store_true", help="Посчитать объём работы без вызовов модели")
+    p_norm.add_argument("--new-version", action="store_true", help="Создать новую версию L2")
+    p_norm.set_defaults(func=cmd_normalize)
 
     return parser
 

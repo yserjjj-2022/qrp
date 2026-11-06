@@ -292,11 +292,12 @@ class TestRebuildBlockers:
 
     def test_text_unit_blocks(self, db: sqlite3.Connection, transcript: Path, settings: Settings) -> None:
         _load(db, transcript, settings)
-        # text_unit появляется только в M1b: создаём минимальную таблицу, чтобы
-        # проверить блокировку заранее, а не после миграции 0005.
-        db.execute("CREATE TABLE text_unit (id INTEGER PRIMARY KEY, utterance_id INTEGER REFERENCES utterance(id))")
+        # text_unit создаётся миграцией 0005 (M1b); проверяем блокировку на ней.
         utterance_id = db.execute("SELECT id FROM utterance ORDER BY id LIMIT 1").fetchone()[0]
-        db.execute("INSERT INTO text_unit (utterance_id) VALUES (?)", (utterance_id,))
+        db.execute(
+            "INSERT INTO text_unit (utterance_id, text) VALUES (?, 'текст')",
+            (utterance_id,),
+        )
         db.commit()
 
         with pytest.raises(SpeakerRolesError, match="text_unit"):

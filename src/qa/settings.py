@@ -82,8 +82,14 @@ class PipelineSettings(BaseModel):
 
 
 class M1bSettings(BaseModel):
-    """Стартовые пороги нормализации L2 (M1b). Уточняются на золотом наборе."""
+    """Настройки нормализации L2 (M1b).
 
+    `min_words_for_model` — минимальная длина реплики респондента для вызова
+    модели. Остальные ключи оставлены для отложенных частей M1b (золотой набор,
+    проверка отношения длин, review-выборка) и сейчас не используются.
+    """
+
+    min_words_for_model: int = Field(default=4, ge=1)
     filler_density_threshold: float = Field(default=0.05, gt=0, le=1)
     len_ratio_min: float = Field(default=0.6, gt=0)
     len_ratio_max: float = Field(default=1.1, gt=0)

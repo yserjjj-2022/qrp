@@ -2,7 +2,9 @@
 
 Все поля и связи фиксируются миграциями в `migrations/`:
 `0001_create_tables.sql` (каркас), `0002_transcript_turns.sql` (записи и реплики),
-`0003_workbook.sql` (рабочая книга, кодбук, лексикон, золотой набор, факты).
+`0003_workbook.sql` (рабочая книга, кодбук, лексикон, золотой набор, факты),
+`0004_turn_speaker_label.sql` (метка говорящего в `turn`),
+`0005_text_unit.sql` (слой L2).
 
 ## Таблицы
 
@@ -348,6 +350,37 @@
 | status | TEXT NOT NULL DEFAULT 'proposed' | proposed / approved / rejected |
 | created_at | TIMESTAMP | |
 | UNIQUE(surface_form, context_utterance_id) | | |
+
+### text_unit (миграция 0005)
+Слой L2: нормализованный текст реплики. Связь с L1 один к одному по версии,
+`UNIQUE(utterance_id, version)`.
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| id | INTEGER PRIMARY KEY | Автоинкремент |
+| utterance_id | INTEGER NOT NULL | Ссылка на `utterance` (L1) |
+| version | INTEGER NOT NULL DEFAULT 1 | Версия L2 |
+| text | TEXT NOT NULL | Текст L2 |
+| status | TEXT NOT NULL DEFAULT 'proposed' | proposed / rejected; других значений нет |
+| asr_quality | TEXT NOT NULL DEFAULT 'ok' | ok / doubtful / garbled |
+| changes_json | TEXT NOT NULL DEFAULT '[]' | Журнал изменений (JSON-массив) |
+| uncertain_spans_json | TEXT NOT NULL DEFAULT '[]' | Фрагменты с неуверенностью (JSON) |
+| fillers_removed | INTEGER NOT NULL DEFAULT 0 | Удалено звуков-паразитов |
+| stutter_removed | INTEGER NOT NULL DEFAULT 0 | Удалено механических заиканий |
+| repeat_unclear | INTEGER NOT NULL DEFAULT 0 | Повторов, оставленных из-за неоднозначности |
+| run_id | INTEGER | Ссылка на `run` |
+| review_status | TEXT | Не используется: ручное ревью отложено |
+| reviewed_at | TIMESTAMP | Не используется: ручное ревью отложено |
+| UNIQUE(utterance_id, version) | | |
+
+`status = proposed` означает, что вывод модели прошёл автопроверки (или модель
+не вызывалась), `rejected` — что вывод отклонён и в `text` лежит результат
+детерминированного прохода. Значения `approved` нет: замораживание версии
+и ручная проверка в текущий объём M1b не входят.
+
+Новая версия L2 создаётся только командой `normalize --new-version`; без флага
+повторный запуск идемпотентен и ничего не перезаписывает. Старые версии
+сохраняются: `text_unit` не обновляется, а дополняется.
 
 ## Допустимые значения справочников (config.yaml)
 

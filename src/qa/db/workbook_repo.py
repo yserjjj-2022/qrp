@@ -332,6 +332,11 @@ class MarkerRepository:
         row = self._conn.execute("SELECT COUNT(*) FROM uncertainty_marker").fetchone()
         return int(row[0])
 
+    def expressions(self) -> list[str]:
+        """Все маркеры неуверенности."""
+        rows = self._conn.execute("SELECT expression FROM uncertainty_marker ORDER BY id").fetchall()
+        return [str(row[0]) for row in rows]
+
 
 class GoldenRepository:
     """Золотой набор: реплики L1 и ручной L2."""
@@ -568,6 +573,19 @@ class InterviewRepository:
         ).fetchall()
         return [int(row[0]) for row in rows]
 
+    def utterances_for_normalize(self, interview_db_id: int) -> list[tuple[int, str, str, int]]:
+        """Реплики интервью в порядке транскрипта: (id, роль, текст, is_backchannel)."""
+        rows = self._conn.execute(
+            "SELECT id, speaker_role, text, is_backchannel FROM utterance WHERE interview_id = ? ORDER BY id",
+            (interview_db_id,),
+        ).fetchall()
+        return [(int(uid), str(role), str(text), int(flag)) for uid, role, text, flag in rows]
+
+    def interview_db_id_by_code(self, interview_code: str) -> int | None:
+        """id интервью по внешнему идентификатору (R01)."""
+        row = self._conn.execute("SELECT id FROM interview WHERE id_external = ?", (interview_code,)).fetchone()
+        return int(row[0]) if row is not None else None
+
     def golden_refs_on_utterances(self, interview_db_id: int) -> int:
         """Сколько записей золотого набора ссылается на реплики интервью (utterance:<id>)."""
         rows = self._conn.execute("SELECT utterance_ref FROM golden_sample WHERE utterance_ref IS NOT NULL").fetchall()
@@ -668,3 +686,133 @@ class NewTermRepository:
             msg = f"Недопустимое решение: {decision!r}"
             raise ValueError(msg)
         self._conn.execute("UPDATE new_term SET status = ? WHERE id = ?", (decision, term_id))
+
+
+@dataclass(frozen=True)
+class UtteranceRow:
+    """Реплика L1 для нормализации."""
+
+    id: int
+    speaker_role: str
+    text: str
+    is_backchannel: bool
+
+
+class TextUnitRepository:
+    """Слой L2: нормализованные единицы по репликам."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def max_version(self, utterance_id: int) -> int:
+        """Наибольшая существующая версия L2 для реплики (0 — записей нет)."""
+        row = self._conn.execute(
+            "SELECT MAX(version) FROM text_unit WHERE utterance_id = ?",
+            (utterance_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else 0
+
+    def exists(self, utterance_id: int, version: int) -> bool:
+        """Есть ли уже единица заданной версии."""
+        row = self._conn.execute(
+            "SELECT 1 FROM text_unit WHERE utterance_id = ? AND version = ?",
+            (utterance_id, version),
+        ).fetchone()
+        return row is not None
+
+    def insert(
+        self,
+        utterance_id: int,
+        version: int,
+        text: str,
+        status: str,
+        asr_quality: str,
+        changes_json: str,
+        uncertain_spans_json: str,
+        fillers_removed: int,
+        stutter_removed: int,
+        repeat_unclear: int,
+        run_id: int | None,
+    ) -> int:
+        """Записать единицу L2."""
+        cursor = self._conn.execute(
+            "INSERT INTO text_unit (utterance_id, version, text, status, asr_quality, changes_json,"
+            " uncertain_spans_json, fillers_removed, stutter_removed, repeat_unclear, run_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                utterance_id,
+                version,
+                text,
+                status,
+                asr_quality,
+                changes_json,
+                uncertain_spans_json,
+                fillers_removed,
+                stutter_removed,
+                repeat_unclear,
+                run_id,
+            ),
+        )
+        new_id = cursor.lastrowid
+        if new_id is None:
+            msg = "SQLite не вернул id вставленной строки text_unit"
+            raise sqlite3.Error(msg)
+        return int(new_id)
+
+    def counts_by_asr_quality(self, interview_db_id: int) -> dict[str, int]:
+        """Распределение asr_quality по единицам интервью."""
+        rows = self._conn.execute(
+            "SELECT t.asr_quality, COUNT(*) FROM text_unit t JOIN utterance u ON t.utterance_id = u.id"
+            " WHERE u.interview_id = ? GROUP BY t.asr_quality",
+            (interview_db_id,),
+        ).fetchall()
+        return {str(quality): int(count) for quality, count in rows}
+
+    def max_version_for_interview(self, interview_db_id: int) -> int:
+        """Наибольшая записанная версия L2 для интервью (0 — записей нет)."""
+        row = self._conn.execute(
+            "SELECT MAX(t.version) FROM text_unit t JOIN utterance u ON t.utterance_id = u.id WHERE u.interview_id = ?",
+            (interview_db_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else 0
+
+    def count_for_interview(self, interview_db_id: int, version: int = 1) -> int:
+        """Сколько единиц L2 записано для интервью."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM text_unit t JOIN utterance u ON t.utterance_id = u.id"
+            " WHERE u.interview_id = ? AND t.version = ?",
+            (interview_db_id, version),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+
+class RunRepository:
+    """Запись прогонов пайплайна."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def start(
+        self,
+        model: str,
+        prompt_hash: str,
+        codebook_version_id: int | None,
+        code_version: str,
+        params_json: str,
+    ) -> int:
+        """Записать начало прогона и вернуть его id."""
+        cursor = self._conn.execute(
+            "INSERT INTO run (model, prompt_hash, codebook_version_id, code_version, params_json)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (model, prompt_hash, codebook_version_id, code_version, params_json),
+        )
+        run_id = cursor.lastrowid
+        if run_id is None:
+            msg = "SQLite не вернул id вставленной строки run"
+            raise sqlite3.Error(msg)
+        return int(run_id)
+
+    def latest_codebook_version_id(self) -> int | None:
+        """Последняя версия кодбука (для привязки прогона)."""
+        row = self._conn.execute("SELECT id FROM codebook_version ORDER BY id DESC LIMIT 1").fetchone()
+        return int(row[0]) if row is not None else None
