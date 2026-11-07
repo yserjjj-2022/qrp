@@ -168,6 +168,7 @@ def normalize_interview(
     markers = load_markers(conn)
     examples = load_examples()
     min_words = settings.m1b.min_words_for_model
+    fuzzy = settings.m1b.fuzzy_config()
 
     outcomes: list[NormalizeOutcome] = []
     for index, (utterance_id, role, text, flag) in enumerate(utterances):
@@ -182,6 +183,8 @@ def normalize_interview(
             examples=examples,
             provider=provider,
             min_words=min_words,
+            fuzzy=fuzzy,
+            domain_hint=settings.domain_hint,
         )
         outcomes.append(outcome)
 

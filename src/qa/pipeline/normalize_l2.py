@@ -15,13 +15,22 @@ import hashlib
 import json
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from qa.llm.base import LlmProvider
 from qa.llm.errors import LlmError, LlmValidationError
-from qa.pipeline.normalize_rules import LexiconEntry, normalize_deterministic
+from qa.pipeline.normalize_rules import (
+    _SOUND_TOKEN_RE,
+    FILLER_PHRASES,
+    FuzzyConfig,
+    LexiconEntry,
+    lemma_of,
+    normalize_deterministic,
+    suspect_words,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +47,15 @@ NORMALIZE_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["term", "filler", "stutter", "order", "punctuation", "garbled"],
+                        "enum": [
+                            "term",
+                            "asr_fix",
+                            "filler",
+                            "stutter",
+                            "order",
+                            "punctuation",
+                            "garbled",
+                        ],
                     },
                     "from": {"type": "string"},
                     "to": {"type": "string"},
@@ -114,6 +131,11 @@ class NormalizeStats:
     term_replacements: dict[str, int] = field(default_factory=dict)
     rejections: dict[str, int] = field(default_factory=dict)
     new_terms: int = 0
+    names_review: int = 0
+    asr_fixes: int = 0
+    fuzzy_replacements: int = 0
+    glued_replacements: int = 0
+    doubtful: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
@@ -156,6 +178,8 @@ def build_prompt(
     lexicon: list[LexiconEntry],
     markers: list[str],
     examples: str,
+    suspect: list[str] | None = None,
+    domain_hint: str = "",
 ) -> str:
     """Собрать промпт из шаблона и данных реплики."""
     template = load_prompt()
@@ -167,10 +191,13 @@ def build_prompt(
         or "- (лексикон пуст)"
     )
     marker_text = ", ".join(markers) or "(список пуст)"
+    suspect_text = ", ".join(suspect or []) or "(нет)"
     return (
         template.replace("{previous_question}", previous_question or "(нет)")
+        .replace("{domain_hint}", domain_hint or "(не задан)")
         .replace("{lexicon}", lexicon_text)
         .replace("{markers}", marker_text)
+        .replace("{suspect}", suspect_text)
         .replace("{utterance}", utterance_text)
         .replace("{examples}", examples)
     )
@@ -232,22 +259,296 @@ def check_names(source: str, target: str, lexicon: list[LexiconEntry]) -> CheckF
     return None
 
 
+def check_capital_words(source: str, target: str, lexicon: list[LexiconEntry]) -> CheckFailure | None:
+    """Мягкая часть проверки названий: заглавные слова без латиницы.
+
+    Заглавное слово, которого нет во входе и в лексиконе с тем же регистром, —
+    повод посмотреть единицу, а не повод её отклонить. Так ловится случай, когда
+    модель капитализировала обычное слово («Приложением» вместо «приложением»).
+    Латиница проверяется отдельно и жёстко.
+    """
+    allowed = {entry.canonical for entry in lexicon}
+    for entry in lexicon:
+        allowed.update(variant for variant in entry.variants)
+    target_folded = target.casefold()
+    for phrase in list(allowed):
+        if " " in phrase.casefold() and phrase.casefold() in target_folded:
+            allowed.update(phrase.split())
+    source_words = set(_WORD_RE.findall(source))
+    for word in _capitalized_words(target):
+        if word in allowed or word in source:
+            continue
+        if word in source_words:
+            continue
+        return CheckFailure("names", f"слово {word!r} отсутствует во входе и в лексиконе")
+    return None
+
+
+def check_latin(source: str, target: str, lexicon: list[LexiconEntry]) -> CheckFailure | None:
+    """Жёсткая часть проверки названий: латиница не выдумана моделью.
+
+    Латиница проверяется отдельно от заглавных слов, потому что при отказе
+    только по заглавным единица сохраняется как `doubtful`, а выдуманная
+    латиница по-прежнему отклоняет единицу.
+    """
+    allowed = {entry.canonical.casefold() for entry in lexicon}
+    for entry in lexicon:
+        allowed.update(variant.casefold() for variant in entry.variants)
+    target_folded = target.casefold()
+    for phrase in list(allowed):
+        if " " in phrase and phrase in target_folded:
+            allowed.update(phrase.split())
+    source_folded = source.casefold()
+    for latin in _LATIN_RE.findall(target):
+        folded = latin.casefold()
+        if folded in allowed or folded in source_folded:
+            continue
+        return CheckFailure("latin", f"латиница {latin!r} отсутствует во входе и в лексиконе")
+    return None
+
+
+def _deleted_tokens(source: str, target: str) -> list[str]:
+    """Слова L1, чьей леммы не стало в L2 (с учётом кратности).
+
+    Сравнение по лемам: «ноутбук» -> «ноутбука» — это словоформа, а не потеря
+    мысли. У неизвестного словарю искажения лемма равна форме, поэтому замена
+    такого слова видна проверке.
+    """
+    remaining = Counter(lemma_of(token) for token in _tokens(target))
+    missing: list[str] = []
+    for token in _tokens(source):
+        lemma = lemma_of(token)
+        if remaining.get(lemma, 0) > 0:
+            remaining[lemma] -= 1
+            continue
+        missing.append(token)
+    return missing
+
+
+def _filler_span(text: str) -> bool:
+    """Состоит ли фрагмент целиком из фраз-паразитов и звуков.
+
+    Фразы вырезаются целиком, чтобы «как бы» не превращалось в два отдельных
+    слова: каждое из них само по себе обычное. Остаток обязан быть пустым или
+    звуками-паразитами.
+    """
+    remainder = text.casefold().replace("ё", "е")
+    for phrase in sorted(FILLER_PHRASES, key=len, reverse=True):
+        phrase_folded = phrase.casefold().replace("ё", "е")
+        pattern = rf"(?<![а-яёa-z0-9]){re.escape(phrase_folded)}(?![а-яёa-z0-9])"
+        remainder = re.sub(pattern, " ", remainder)
+    return all(_SOUND_TOKEN_RE.match(token) for token in _tokens(remainder))
+
+
+def _declared_removals(changes: list[dict[str, Any]]) -> Counter[str]:
+    """Леммы слов, которые модель заявила как законно удалённые или заменённые.
+
+    Удаление `to=""` и замена `from -> to` объясняют исчезновение слов из `from`.
+    Записи `filler` и `stutter` принимаются только для настоящего паразита
+    (включая фразовые) или механического повтора: иначе модель могла бы
+    объявить удаление любого слова.
+    """
+    removed: Counter[str] = Counter()
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        kind = change.get("type")
+        if kind not in ("filler", "stutter", "term", "asr_fix", "order", "garbled"):
+            continue
+        from_text = str(change.get("from") or "")
+        from_tokens = _tokens(from_text)
+        if not from_tokens:
+            continue
+        if kind == "filler" and not _filler_span(from_text):
+            continue
+        if kind == "stutter" and from_tokens.count(from_tokens[0]) < 2:
+            continue
+        for token in from_tokens:
+            removed[lemma_of(token)] += 1
+    return removed
+
+
+def _is_filler_token(token: str) -> bool:
+    """Паразит из списка или звук-паразит: удалять можно без потери мысли."""
+    folded = token.casefold()
+    return folded in FILLER_PHRASES or bool(_SOUND_TOKEN_RE.match(folded))
+
+
+def _phrase_filler_removals(source: str, target: str) -> Counter[str]:
+    """Сколько вхождений каждого токена объясняется фразами-паразитами L1.
+
+    Фразовый паразит («как бы», «то есть») состоит из обычных слов, поэтому
+    по отдельности они не считаются паразитами. Каждое вхождение фразы в L1
+    разрешает удалить её слова один раз. Вычитать вхождения в L2 нельзя:
+    модель может удалить одну фразу и оставить другую, и подсчёт по позициям
+    дал бы ложный отказ.
+    """
+    source_folded = source.casefold().replace("ё", "е")
+    target_folded = target.casefold().replace("ё", "е")
+    removed: Counter[str] = Counter()
+    for phrase in sorted(FILLER_PHRASES, key=len, reverse=True):
+        phrase_folded = phrase.casefold().replace("ё", "е")
+        pattern = rf"(?<![а-яёa-z0-9]){re.escape(phrase_folded)}(?![а-яёa-z0-9])"
+        missing = len(re.findall(pattern, source_folded)) - len(re.findall(pattern, target_folded))
+        for _ in range(max(0, missing)):
+            for token in _tokens(phrase):
+                removed[lemma_of(token)] += 1
+    return removed
+
+
+def _mechanical_repeat_counts(source: str) -> Counter[str]:
+    """Сколько раз слово повторяется подряд в L1 (сверх первого вхождения).
+
+    Механический повтор служебного слова («и и», «они, они, они») можно
+    схлопнуть: лишние вхождения не несут смысла. Ключ — лемма, как и в
+    остальных проверках потери мысли.
+    """
+    extra: Counter[str] = Counter()
+    matches = list(_WORD_RE.finditer(source))
+    previous = ""
+    for match in matches:
+        lemma = lemma_of(match.group(0))
+        if lemma == previous:
+            extra[lemma] += 1
+        previous = lemma
+    return extra
+
+
+def check_thought_loss(source: str, target: str, changes: list[dict[str, Any]]) -> CheckFailure | None:
+    """Проверка 5: из L1 не исчезают слова, кроме паразитов и механических повторов.
+
+    Удаление принимается, если слово — паразит из списка (или звук), если это
+    лишнее вхождение подряд идущего повтора, либо если лемма слова есть среди
+    законных удалений из `changes`. Законность записи проверяет
+    `_declared_removals`: `filler` только для настоящей фразы-паразита,
+    `stutter` только для механического повтора, иначе модель могла бы объявить
+    удаление любого слова. Сравнение идёт по лемам: смена словоформы —
+    не потеря мысли. Любое другое исчезновение отклоняет единицу.
+    """
+    deleted = _deleted_tokens(source, target)
+    if not deleted:
+        return None
+    declared = _declared_removals(changes)
+    declared.update(_phrase_filler_removals(source, target))
+    repeats = _mechanical_repeat_counts(source)
+    unexplained: list[str] = []
+    for token in deleted:
+        if _is_filler_token(token):
+            continue
+        lemma = lemma_of(token)
+        if repeats.get(lemma, 0) > 0:
+            repeats[lemma] -= 1
+            continue
+        if declared.get(lemma, 0) > 0:
+            declared[lemma] -= 1
+            continue
+        unexplained.append(token)
+    if not unexplained:
+        return None
+    return CheckFailure("thought_loss", f"потеряны слова без основания: {len(unexplained)}")
+
+
+def _allowed_new_words(lexicon: list[LexiconEntry]) -> set[str]:
+    """Леммы канонов и вариантов лексикона, которые допустимы в L2."""
+    allowed: set[str] = set()
+    for entry in lexicon:
+        allowed.add(lemma_of(entry.canonical))
+        for variant in entry.variants:
+            allowed.add(lemma_of(variant))
+    return allowed
+
+
+def check_new_words(
+    source: str,
+    target: str,
+    lexicon: list[LexiconEntry],
+    changes: list[dict[str, Any]],
+) -> tuple[CheckFailure | None, bool]:
+    """Проверка 6: в L2 нет новых смысловых слов.
+
+    Сравнение по лемам: законная словоформа не считается новым словом.
+    Returns:
+        (жёсткий отказ, признак `doubtful`). Жёстко отклоняются только новые
+        заглавные слова и латиница: это может быть выдуманное название.
+        Остальные новые леммы дают флаг `doubtful`, а не отказ.
+    """
+    source_lemmas = {lemma_of(token) for token in _tokens(source)}
+    allowed = source_lemmas | _allowed_new_words(lexicon)
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        for token in _tokens(str(change.get("to") or "")):
+            allowed.add(lemma_of(token))
+    new_lemmas: list[str] = []
+    for token in _tokens(target):
+        lemma = lemma_of(token)
+        if lemma in allowed:
+            continue
+        if token.casefold() in allowed:
+            continue
+        if lemma not in new_lemmas:
+            new_lemmas.append(lemma)
+    if not new_lemmas:
+        return None, False
+    capital_or_latin = [
+        value for value in new_lemmas if any(char.isupper() for char in value) or bool(_LATIN_RE.search(value))
+    ]
+    if capital_or_latin:
+        return CheckFailure("new_words", f"новые названия: {len(capital_or_latin)}"), True
+    return None, True
+
+
+def check_asr_fix(
+    source: str,
+    target: str,
+    lexicon: list[LexiconEntry],
+    changes: list[dict[str, Any]],
+) -> CheckFailure | None:
+    """Проверка `asr_fix`: исправлять по контексту можно только подозрительные слова.
+
+    Подозрительное слово — то, которого нет ни в словаре pymorphy3, ни в
+    лексиконе. Иначе модель могла бы подменить обычную лексику «по контексту»,
+    а это уже переписывание смысла. Исправленное слово должно остаться в L2.
+    """
+    suspicious = set(suspect_words(source, lexicon))
+    target_folded = target.casefold()
+    for change in changes:
+        if not isinstance(change, dict) or change.get("type") != "asr_fix":
+            continue
+        from_tokens = _tokens(str(change.get("from") or ""))
+        if not from_tokens:
+            return CheckFailure("asr_fix", "asr_fix без исходного слова")
+        unknown = [token for token in from_tokens if token not in suspicious]
+        if unknown:
+            return CheckFailure("asr_fix", f"asr_fix для слова не из подозрительных: {len(unknown)}")
+        to_text = str(change.get("to") or "").strip()
+        if not to_text or to_text.casefold() not in target_folded:
+            return CheckFailure("asr_fix", "исправление asr_fix отсутствует в L2")
+    return None
+
+
 def run_checks(
     source: str,
     target: str,
     markers: list[str],
     lexicon: list[LexiconEntry],
+    changes: list[dict[str, Any]] | None = None,
 ) -> list[CheckFailure]:
-    """Выполнить все автопроверки вывода модели."""
+    """Выполнить жёсткие автопроверки вывода модели."""
     failures: list[CheckFailure] = []
     for failure in (
         check_numbers(source, target),
         check_negations(source, target),
         check_uncertainty(source, target, markers),
-        check_names(source, target, lexicon),
+        check_latin(source, target, lexicon),
+        check_asr_fix(source, target, lexicon, changes or []),
+        check_thought_loss(source, target, changes or []),
     ):
         if failure is not None:
             failures.append(failure)
+    hard, _doubtful = check_new_words(source, target, lexicon, changes or [])
+    if hard is not None:
+        failures.append(hard)
     return failures
 
 
@@ -263,6 +564,9 @@ def normalize_utterance(
     examples: str,
     provider: LlmProvider | None,
     min_words: int,
+    fuzzy: FuzzyConfig | None = None,
+    suspect: list[str] | None = None,
+    domain_hint: str = "",
 ) -> NormalizeOutcome:
     """Нормализовать одну реплику.
 
@@ -271,14 +575,21 @@ def normalize_utterance(
         role: роль говорящего.
         is_backchannel: короткая вставка-подтверждение.
         text: исходный текст L1.
-        previous_text: текст предыдущей реплики интервьюера.
+        previous_question: текст предыдущей реплики интервьюера.
         lexicon: термины с вариантами.
         markers: маркеры неуверенности.
         examples: синтетические примеры для промпта.
         provider: провайдер LLM; None — только детерминированный проход.
         min_words: минимальная длина реплики для вызова модели.
+        fuzzy: пороги нечёткого сопоставления с лексиконом.
+        suspect: подозрительные слова (нет в словаре и лексиконе) для промпта.
+        domain_hint: строка предметной области для промпта.
     """
-    deterministic = normalize_deterministic(text, lexicon)
+    # Нечёткая замена терминов — правило для реплик респондента. У интервьюера
+    # формулировка нужна дословной, а его текст и так проходит точный лексикон.
+    deterministic = normalize_deterministic(text, lexicon, fuzzy if role == "RESPONDENT" else None)
+    if suspect is None:
+        suspect = suspect_words(deterministic.text, lexicon)
     outcome = NormalizeOutcome(
         utterance_id=utterance_id,
         text=deterministic.text,
@@ -293,7 +604,15 @@ def normalize_utterance(
     if provider is None or not should_use_model(role, is_backchannel, text, min_words):
         return outcome
 
-    prompt = build_prompt(deterministic.text, previous_question, lexicon, markers, examples)
+    prompt = build_prompt(
+        deterministic.text,
+        previous_question,
+        lexicon,
+        markers,
+        examples,
+        suspect,
+        domain_hint,
+    )
     try:
         result = provider.complete_json_detailed(prompt, NORMALIZE_SCHEMA)
     except LlmValidationError as exc:
@@ -335,7 +654,8 @@ def _apply_model_output(
     outcome.uncertain_spans = [str(item) for item in data.get("uncertain_spans") or []]
     outcome.new_terms = [str(item).strip() for item in data.get("new_terms") or [] if str(item).strip()]
 
-    failures = run_checks(deterministic_text, normalized, markers, lexicon)
+    model_changes = [item for item in data.get("changes") or [] if isinstance(item, dict)]
+    failures = run_checks(deterministic_text, normalized, markers, lexicon, model_changes)
     if not normalized:
         failures.append(CheckFailure("empty", "модель вернула пустой текст"))
     if failures:
@@ -343,20 +663,25 @@ def _apply_model_output(
         outcome.failures = failures
         outcome.changes = [
             *outcome.changes,
-            *[{"type": "rejected", "check": item.check} for item in failures],
+            *[{"type": "rejected", "check": failure.check} for failure in failures],
             {"type": "model_output", "text": normalized},
         ]
         logger.info(
             "LLM: реплика %d отклонена автопроверкой (%s)",
             outcome.utterance_id,
-            ",".join(item.check for item in failures),
+            ",".join(failure.check for failure in failures),
         )
         return outcome
 
-    model_changes = data.get("changes")
-    if isinstance(model_changes, list):
-        outcome.changes = [*outcome.changes, *[item for item in model_changes if isinstance(item, dict)]]
+    outcome.changes = [*outcome.changes, *model_changes]
     outcome.text = normalized
+    _hard, new_doubtful = check_new_words(deterministic_text, normalized, lexicon, model_changes)
+    if new_doubtful:
+        outcome.asr_quality = "doubtful"
+    names_failure = check_capital_words(deterministic_text, normalized, lexicon)
+    if names_failure is not None:
+        outcome.asr_quality = "doubtful"
+        outcome.changes = [*outcome.changes, {"type": "names_review", "detail": names_failure.detail}]
     return outcome
 
 
@@ -394,6 +719,10 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
     quality: dict[str, int] = {}
     rejections: dict[str, int] = {}
     terms: dict[str, int] = {}
+    names_review = 0
+    asr_fixes = 0
+    fuzzy_replacements = 0
+    glued_replacements = 0
     for outcome in outcomes:
         quality[outcome.asr_quality] = quality.get(outcome.asr_quality, 0) + 1
         for failure in outcome.failures:
@@ -401,6 +730,14 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
         for change in outcome.changes:
             if change.get("type") == "term" and isinstance(change.get("to"), str):
                 terms[change["to"]] = terms.get(change["to"], 0) + 1
+                if change.get("fuzzy"):
+                    fuzzy_replacements += 1
+                if change.get("glued"):
+                    glued_replacements += 1
+            elif change.get("type") == "names_review":
+                names_review += 1
+            elif change.get("type") == "asr_fix":
+                asr_fixes += 1
     return NormalizeStats(
         total=len(outcomes),
         proposed=sum(1 for item in outcomes if item.status == "proposed"),
@@ -414,6 +751,11 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
         term_replacements=terms,
         rejections=rejections,
         new_terms=sum(len(item.new_terms) for item in outcomes),
+        names_review=names_review,
+        asr_fixes=asr_fixes,
+        fuzzy_replacements=fuzzy_replacements,
+        glued_replacements=glued_replacements,
+        doubtful=quality.get("doubtful", 0),
         prompt_tokens=sum(item.prompt_tokens for item in outcomes),
         completion_tokens=sum(item.completion_tokens for item in outcomes),
     )

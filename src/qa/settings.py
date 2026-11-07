@@ -9,6 +9,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from qa.pipeline.normalize_rules import FuzzyConfig
+
 ColumnType = Literal["str", "text", "int", "date", "list", "notes"]
 ListKind = Literal["code", "question", "plain"]
 
@@ -85,15 +87,29 @@ class M1bSettings(BaseModel):
     """Настройки нормализации L2 (M1b).
 
     `min_words_for_model` — минимальная длина реплики респондента для вызова
-    модели. Остальные ключи оставлены для отложенных частей M1b (золотой набор,
+    модели. `fuzzy_lexicon_threshold` и `fuzzy_lexicon_short_threshold` задают
+    нечёткое сопоставление с лексиконом в детерминированном проходе: для слов
+    короче `fuzzy_short_word_length` действует более строгий порог.
+    Остальные ключи оставлены для отложенных частей M1b (золотой набор,
     проверка отношения длин, review-выборка) и сейчас не используются.
     """
 
     min_words_for_model: int = Field(default=4, ge=1)
+    fuzzy_lexicon_threshold: float = Field(default=0.80, gt=0, le=1)
+    fuzzy_lexicon_short_threshold: float = Field(default=0.93, gt=0, le=1)
+    fuzzy_short_word_length: int = Field(default=5, ge=2)
     filler_density_threshold: float = Field(default=0.05, gt=0, le=1)
     len_ratio_min: float = Field(default=0.6, gt=0)
     len_ratio_max: float = Field(default=1.1, gt=0)
     review_sample_share: float = Field(default=0.10, ge=0, le=1)
+
+    def fuzzy_config(self) -> FuzzyConfig:
+        """Пороги нечёткого сопоставления для детерминированного прохода."""
+        return FuzzyConfig(
+            threshold=self.fuzzy_lexicon_threshold,
+            short_threshold=self.fuzzy_lexicon_short_threshold,
+            short_word_length=self.fuzzy_short_word_length,
+        )
 
 
 class GroupsSettings(BaseModel):
@@ -242,6 +258,9 @@ class Settings(BaseModel):
     workbook: WorkbookSettings = WorkbookSettings()
     groups: GroupsSettings = GroupsSettings()
     lexicon_status_map: dict[str, str] = Field(default_factory=dict)
+    # Строка предметной области для промпта нормализации (ключ `domain_hint`).
+    # Сведений в L2 не добавляет: только помогает отличать термины от искажений.
+    domain_hint: str = ""
 
     @model_validator(mode="before")
     @classmethod

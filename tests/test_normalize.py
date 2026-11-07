@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -19,15 +20,21 @@ from qa.llm.errors import LlmValidationError
 from qa.pipeline.normalize import NormalizeError, normalize_interview, plan_dry_run
 from qa.pipeline.normalize_l2 import (
     NORMALIZE_SCHEMA,
+    build_prompt,
+    check_asr_fix,
+    check_capital_words,
+    check_latin,
     check_names,
     check_negations,
+    check_new_words,
     check_numbers,
+    check_thought_loss,
     check_uncertainty,
     normalize_utterance,
     run_checks,
     should_use_model,
 )
-from qa.pipeline.normalize_rules import LexiconEntry, normalize_deterministic
+from qa.pipeline.normalize_rules import FuzzyConfig, LexiconEntry, normalize_deterministic, suspect_words
 from qa.settings import Settings
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +42,7 @@ _MIGRATIONS_DIR = _PROJECT_ROOT / "migrations"
 
 _MARKERS = ["не знаю", "не помню", "наверное", "возможно", "вроде"]
 _LEXICON = [LexiconEntry(canonical="MCP", variants=("эсипи", "эс-и-пи"))]
+_PROMPT_PLACEHOLDER = re.compile(r"\{[a-z_]+\}")
 
 
 class FakeProvider(LlmProvider):
@@ -159,8 +167,121 @@ class TestDeterministicRules:
         assert result.text == "Привет, мир."
 
 
-class TestModelSelection:
-    """Кто попадает в модель."""
+class TestFuzzyLexicon:
+    """Пункт 1: нечёткое сопоставление с лексиконом в детерминированном проходе."""
+
+    def test_emspi_and_msipi_become_mcp(self) -> None:
+        for surface in ("эмсипи", "мсипи", "Мсипи", "Эмсипи"):
+            result = normalize_deterministic(f"Подключил {surface} Финам", _LEXICON)
+            assert "MCP" in result.text
+            assert "мсипи" not in result.text.casefold()
+
+    def test_fuzzy_change_marked(self) -> None:
+        result = normalize_deterministic("у меня есть эмсипи", _LEXICON)
+        entries = [item for item in result.changes if item.get("type") == "term"]
+        assert entries == [{"type": "term", "from": "эмсипи", "to": "MCP", "fuzzy": True}]
+        assert result.fuzzy_replacements == 1
+
+    def test_short_utterance_still_fixed(self) -> None:
+        """Реплика короче min_words_for_model исправляется без вызова модели."""
+        provider = FakeProvider([])
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "С мсипи ничего",
+            previous_question=None,
+            lexicon=_LEXICON,
+            markers=_MARKERS,
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+            fuzzy=FuzzyConfig(),
+        )
+        assert "MCP" in outcome.text
+        assert provider.prompts == []
+
+    def test_known_word_not_replaced(self) -> None:
+        """Слово, известное pymorphy3, нечётко не заменяется."""
+        entries = [LexiconEntry(canonical="Регламент", variants=())]
+        result = normalize_deterministic("Он регламентировал процесс", entries)
+        assert "Регламент" not in result.text
+        assert "регламентировал" in result.text.casefold()
+        assert result.fuzzy_replacements == 0
+
+    def test_exact_variant_not_double_counted(self) -> None:
+        """Точный вариант уже заменён, нечёткий проход его не трогает."""
+        result = normalize_deterministic("Подключил эсипи Финам", _LEXICON)
+        fuzzy = [item for item in result.changes if item.get("fuzzy")]
+        assert fuzzy == []
+
+    def test_short_word_stricter_threshold(self) -> None:
+        """Короткие слова сравниваются строже: «про» не станет термином."""
+        entries = [LexiconEntry(canonical="Прод", variants=())]
+        result = normalize_deterministic("про это сказал", entries)
+        assert "про это" in result.text.casefold()
+
+    def test_pair_glued_by_lexicon(self) -> None:
+        entries = [LexiconEntry(canonical="ребалансировка", variants=())]
+        result = normalize_deterministic("приходит ре балансланировка", entries)
+        assert "ребалансировка" in result.text.casefold()
+        assert result.glued_replacements == 1
+        glued = [item for item in result.changes if item.get("glued")]
+        assert glued == [{"type": "term", "from": "ре балансланировка", "to": "ребалансировка", "glued": True}]
+
+    def test_pair_glued_exact_form(self) -> None:
+        entries = [LexiconEntry(canonical="ребалансировка", variants=())]
+        result = normalize_deterministic("там ре баланснировка простая", entries)
+        assert "ребалансировка" in result.text.casefold()
+
+    def test_glue_marked_separately_from_fuzzy(self) -> None:
+        """Склейка — отдельное правило: своя пометка и свой счётчик."""
+        entries = [LexiconEntry(canonical="ребалансировка", variants=())]
+        result = normalize_deterministic("там ре баланснировка простая", entries)
+        assert result.glued_replacements == 1
+        assert result.fuzzy_replacements == 0
+
+    def test_glue_keeps_inflection(self) -> None:
+        """Форму задаёт второе слово: «ре балансланировку» -> «ребалансировку»."""
+        entries = [LexiconEntry(canonical="ребалансировка", variants=())]
+        result = normalize_deterministic("провели ре балансланировку и всё", entries)
+        assert "ребалансировку" in result.text.casefold()
+        assert "ребалансировка" not in result.text.casefold()
+
+    def test_exact_glued_term_not_double_counted(self) -> None:
+        """Точный вариант уже заменён, склейка не дублирует запись."""
+        entries = [LexiconEntry(canonical="Transaq Connector", variants=("транзак коннектор",))]
+        result = normalize_deterministic("транзак коннектор подключил", entries)
+        glued = [item for item in result.changes if item.get("glued")]
+        assert glued == []
+        assert result.glued_replacements == 0
+
+    def test_known_pair_not_glued(self) -> None:
+        """Пара известных словарю слов не склеивается в термин."""
+        entries = [LexiconEntry(canonical="ИИ", variants=())]
+        result = normalize_deterministic("и и всё", entries)
+        assert "ИИ" not in result.text
+
+    def test_function_word_not_glued(self) -> None:
+        """Служебное слово слева не приклеивается к термину: «и эмсипи» -> «и MCP»."""
+        entries = [LexiconEntry(canonical="MCP", variants=("эсипи",))]
+        result = normalize_deterministic("у меня и эмсипи есть", entries)
+        assert "и MCP" in result.text
+        assert "иэмсипи" not in result.text.casefold()
+        assert [item["from"] for item in result.changes if item.get("fuzzy")] == ["эмсипи"]
+
+    def test_word_form_of_canon_kept(self) -> None:
+        """Падежная форма канона не заменяется: «в Финаме» остаётся."""
+        entries = [LexiconEntry(canonical="Финам", variants=())]
+        result = normalize_deterministic("я в Финаме открыл счёт", entries)
+        assert "в Финаме" in result.text
+        assert result.fuzzy_replacements == 0
+
+    def test_inflected_replacement(self) -> None:
+        """Замена согласуется по форме: «про реглантировку» -> «про ребалансировку»."""
+        entries = [LexiconEntry(canonical="ребалансировка", variants=("реглантировка",))]
+        result = normalize_deterministic("рассказал про реглантировку портфеля", entries)
+        assert "про ребалансировку" in result.text.casefold()
 
     def test_interviewer_never_uses_model(self) -> None:
         assert should_use_model("INTERVIEWER", False, "длинная реплика интервьюера из многих слов", 4) is False
@@ -173,6 +294,272 @@ class TestModelSelection:
 
     def test_long_respondent_used(self) -> None:
         assert should_use_model("RESPONDENT", False, "я подключил счёт и всё работает", 4) is True
+
+
+class TestSuspectWords:
+    """Пункт 4: список слов, которых нет в словаре и лексиконе."""
+
+    def test_known_word_excluded(self) -> None:
+        assert "интервью" not in suspect_words("Это интервью про счёт", [])
+
+    def test_lexicon_term_and_form_excluded(self) -> None:
+        entries = [LexiconEntry(canonical="ребалансировка", variants=())]
+        found = suspect_words("Обсудили ребалансировку и ребалансировки портфеля", entries)
+        assert found == []
+
+    def test_multiword_term_words_excluded(self) -> None:
+        entries = [LexiconEntry(canonical="Transaq Connector", variants=("транзак коннектор",))]
+        assert suspect_words("через транзак коннектор работает", entries) == []
+
+    def test_invented_word_included(self) -> None:
+        assert suspect_words("Там автослеле и нечечно", []) == ["автослеле", "нечечно"]
+
+    def test_short_words_excluded(self) -> None:
+        found = suspect_words("э м аа ну да", [])
+        assert found == []
+
+    def test_numbers_excluded(self) -> None:
+        assert suspect_words("пришло 100000 рублей", []) == []
+
+    def test_unique_in_order_of_appearance(self) -> None:
+        assert suspect_words("нечечно там нечечно автослеле", []) == ["нечечно", "автослеле"]
+
+    def test_build_prompt_contains_suspect(self) -> None:
+        prompt = build_prompt("текст", None, [], [], "примеры", suspect=["автослеле", "нечечно"])
+        assert "автослеле, нечечно" in prompt
+        assert "{suspect}" not in prompt
+
+    def test_build_prompt_empty_suspect(self) -> None:
+        prompt = build_prompt("текст", None, [], [], "примеры", suspect=None)
+        assert "{suspect}" not in prompt
+        assert "автослеле" not in prompt
+        assert "(нет)" in prompt
+
+    def test_build_prompt_has_no_placeholders(self) -> None:
+        prompt = build_prompt(
+            "реплика",
+            "вопрос",
+            _LEXICON,
+            _MARKERS,
+            "примеры",
+            suspect=["нечечно"],
+            domain_hint="предметная область",
+        )
+        assert _PROMPT_PLACEHOLDER.findall(prompt) == []
+        assert "реплика" in prompt
+        assert "вопрос" in prompt
+        assert "предметная область" in prompt
+        assert "эсипи" in prompt
+        assert "не знаю" in prompt
+
+    def test_build_prompt_default_domain_hint(self) -> None:
+        prompt = build_prompt("реплика", None, [], [], "примеры")
+        assert "(не задан)" in prompt
+        assert "{domain_hint}" not in prompt
+
+    def test_normalize_utterance_passes_suspect(self) -> None:
+        provider = FakeProvider([_ok("Там нечечно и всё.")])
+        normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "там нечечно и всё работает",
+            previous_question=None,
+            lexicon=[],
+            markers=[],
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+            suspect=["нечечно"],
+        )
+        assert "нечечно" in provider.prompts[0]
+        assert "{suspect}" not in provider.prompts[0]
+
+
+class TestThoughtLoss:
+    """Пункт 2: удаление слов без основания отклоняет единицу."""
+
+    def test_thought_removal_rejected(self) -> None:
+        """«на средне они» нельзя удалить как мусор."""
+        failure = check_thought_loss(
+            "Ну, скрипты есть на на средне они, во-первых, написано",
+            "Ну, скрипты есть, во-первых, написано.",
+            [],
+        )
+        assert failure is not None
+        assert failure.check == "thought_loss"
+
+    def test_filler_removal_allowed(self) -> None:
+        assert check_thought_loss("Я, ну, не помню", "Я не помню.", []) is None
+
+    def test_sound_removal_allowed(self) -> None:
+        assert check_thought_loss("Ну э-э я подключил", "Ну я подключил.", []) is None
+
+    def test_mechanical_repeat_allowed(self) -> None:
+        assert check_thought_loss("Они, они, они на подстраховке", "Они на подстраховке.", []) is None
+
+    def test_claimed_filler_for_content_word_rejected(self) -> None:
+        """Модель не может объявить удаление обычного слова через changes."""
+        failure = check_thought_loss(
+            "Там балансировка и портфель",
+            "Там портфель.",
+            [{"type": "filler", "from": "балансировка", "to": ""}],
+        )
+        assert failure is not None
+        assert failure.check == "thought_loss"
+
+    def test_claimed_stutter_for_single_word_rejected(self) -> None:
+        failure = check_thought_loss(
+            "Там балансировка и портфель",
+            "Там портфель.",
+            [{"type": "stutter", "from": "балансировка", "to": ""}],
+        )
+        assert failure is not None
+
+    def test_claimed_stutter_for_repeat_accepted(self) -> None:
+        assert (
+            check_thought_loss(
+                "Они, они, они на портфеле",
+                "Они на портфеле.",
+                [{"type": "stutter", "from": "Они, они, они", "to": "Они"}],
+            )
+            is None
+        )
+
+    def test_term_replacement_allowed(self) -> None:
+        assert (
+            check_thought_loss(
+                "подключил эсипи Финам",
+                "Подключил MCP Финам.",
+                [{"type": "term", "from": "эсипи", "to": "MCP"}],
+            )
+            is None
+        )
+
+
+class TestAsrFix:
+    """Пункт 3: asr_fix только для подозрительных слов."""
+
+    def test_fix_of_unknown_word_allowed(self) -> None:
+        assert (
+            check_asr_fix(
+                "стоит гидроскал на стенде",
+                "Стоит гидроскан на стенде.",
+                [],
+                [{"type": "asr_fix", "from": "гидроскал", "to": "гидроскан"}],
+            )
+            is None
+        )
+
+    def test_fix_of_known_word_rejected(self) -> None:
+        failure = check_asr_fix(
+            "мне это удобно",
+            "Мне это удобно.",
+            [],
+            [{"type": "asr_fix", "from": "удобно", "to": "удобнее"}],
+        )
+        assert failure is not None
+        assert failure.check == "asr_fix"
+
+    def test_fix_target_must_be_in_l2(self) -> None:
+        failure = check_asr_fix(
+            "стоит гидроскал на стенде",
+            "Стоит гидроскал на стенде.",
+            [],
+            [{"type": "asr_fix", "from": "гидроскал", "to": "гидроскан"}],
+        )
+        assert failure is not None
+
+    def test_no_asr_fix_changes_pass(self) -> None:
+        assert check_asr_fix("мне это удобно", "Мне это удобно.", [], []) is None
+
+
+class TestNewWords:
+    """Пункт 2: сравнение по лемам, а не по формам."""
+
+    def test_inflected_form_not_new(self) -> None:
+        hard, doubtful = check_new_words("он купил акции", "Он купил акцию.", [], [])
+        assert hard is None
+        assert doubtful is False
+
+    def test_unknown_lowercase_lemma_doubtful(self) -> None:
+        hard, doubtful = check_new_words("там было непонятно", "Там было нечечно.", [], [])
+        assert hard is None
+        assert doubtful is True
+
+    def test_new_capital_word_rejected(self) -> None:
+        hard, _doubtful = check_new_words("я пользуюсь приложением", "Я пользуюсь SuperApp.", [], [])
+        assert hard is not None
+        assert hard.check == "new_words"
+
+    def test_lexicon_lemma_allowed(self) -> None:
+        entries = [LexiconEntry(canonical="автоследование", variants=("автослед",))]
+        hard, doubtful = check_new_words("включил автослед", "Включил автоследование.", entries, [])
+        assert hard is None
+        assert doubtful is False
+
+    def test_change_target_allowed(self) -> None:
+        hard, doubtful = check_new_words(
+            "там автослеле работает",
+            "Там автоследование работает.",
+            [],
+            [{"type": "asr_fix", "from": "автослеле", "to": "автоследование"}],
+        )
+        assert hard is None
+        assert doubtful is False
+
+
+class TestNamesReview:
+    """Пункт 6: проверка названий — флаг, латиница — жёсткий отказ."""
+
+    def test_capital_word_flagged_not_rejected(self) -> None:
+        failure = check_capital_words("я пользуюсь приложением", "Я пользуюсь SuperApp.", [])
+        assert failure is not None
+        assert failure.check == "names"
+
+    def test_latin_is_hard(self) -> None:
+        failure = check_latin("я пользуюсь приложением", "Я пользуюсь SuperApp.", [])
+        assert failure is not None
+        assert failure.check == "latin"
+
+    def test_known_latin_allowed(self) -> None:
+        entries = [LexiconEntry(canonical="MCP", variants=("эсипи",))]
+        assert check_latin("подключил эсипи", "Подключил MCP.", entries) is None
+
+    def test_names_flag_set_on_success(self) -> None:
+        provider = FakeProvider([_ok("Я пользуюсь SuperApp.")])
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "я пользуюсь приложением постоянно",
+            previous_question=None,
+            lexicon=[],
+            markers=[],
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        assert outcome.status == "rejected"
+
+    def test_capital_word_saved_with_flag(self) -> None:
+        """Единица не прошла только check_names: текст модели сохранён, doubtful."""
+        provider = FakeProvider([_ok("Я пользуюсь Приложением постоянно.")])
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "я пользуюсь приложением постоянно",
+            previous_question=None,
+            lexicon=[],
+            markers=[],
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        assert outcome.status == "proposed"
+        assert outcome.asr_quality == "doubtful"
+        assert any(item.get("type") == "names_review" for item in outcome.changes)
 
 
 class TestChecks:
@@ -541,6 +928,7 @@ class TestSchema:
         item = NORMALIZE_SCHEMA["properties"]["changes"]["items"]
         assert item["properties"]["type"]["enum"] == [
             "term",
+            "asr_fix",
             "filler",
             "stutter",
             "order",

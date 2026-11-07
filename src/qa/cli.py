@@ -342,9 +342,35 @@ def cmd_normalize(args: argparse.Namespace) -> int:
         f"неясных повторов={stats.repeat_unclear}"
     )
     print(f"  замены по лексикону: {terms}")
+    print(
+        f"  fuzzy-замен={stats.fuzzy_replacements}, склеек={stats.glued_replacements}, "
+        f"asr_fix={stats.asr_fixes}, пометок названий={stats.names_review}"
+    )
     print(f"  отказы автопроверок: {rejections}")
     print(f"  new_term={stats.new_terms}, токены: prompt={stats.prompt_tokens}, completion={stats.completion_tokens}")
+
+    if args.review_export:
+        _export_review(settings, result.interview_code, result.version, run_id)
     return 0
+
+
+def _export_review(settings: Settings, interview_code: str, version: int, run_id: str) -> None:
+    """Выгрузить файл ручной проверки L2 в data/exports."""
+    from qa.pipeline.review_export import export_manual_review
+
+    output = Path(settings.paths.exports) / f"normalize_review_{interview_code}_v{version}.xlsx"
+    conn = _open_db(settings)
+    try:
+        review = export_manual_review(conn, interview_code, version, output)
+    except ValueError as exc:
+        print(f"[{run_id}] normalize: ручная проверка не выгружена — {exc}")
+        return
+    finally:
+        conn.close()
+    print(
+        f"[{run_id}] ручная проверка: {review.n_rows} строк "
+        f"(флаги={review.flagged}, случайных={review.sampled}) -> {review.path}"
+    )
 
 
 def _settings_error_summary(exc: Exception) -> str:
@@ -408,6 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_norm.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
     p_norm.add_argument("--dry-run", action="store_true", help="Посчитать объём работы без вызовов модели")
     p_norm.add_argument("--new-version", action="store_true", help="Создать новую версию L2")
+    p_norm.add_argument("--review-export", action="store_true", help="Выгрузить файл ручной проверки L2")
     p_norm.set_defaults(func=cmd_normalize)
 
     return parser
