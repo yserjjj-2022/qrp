@@ -60,7 +60,11 @@ ASR_QUALITIES = ("ok", "doubtful", "garbled")
 _NEGATIONS = ("не", "нет", "ни", "без")
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
 _WORD_RE = re.compile(r"[а-яёa-z]+(?:-[а-яёa-z]+)?", re.IGNORECASE)
-_CAPITAL_RE = re.compile(r"(?<![.!?…]\s)(?<!^)\b([А-ЯЁA-Z][а-яёa-z\-]+)")
+# Начало предложения: после терминатора, двоеточия, тире, открывающей кавычки
+# или скобки и перевода строки. Модель расставляет регистр по своим правилам
+# пунктуации, поэтому заглавная в такой позиции не считается выдуманным словом.
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?…:—«(\[\n]")
+_CAPITAL_WORD_RE = re.compile(r"[А-ЯЁA-Z][а-яёa-z\-]+")
 _LATIN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]*")
 
 
@@ -87,6 +91,7 @@ class NormalizeOutcome:
     repeat_unclear: int = 0
     new_terms: list[str] = field(default_factory=list)
     failures: list[CheckFailure] = field(default_factory=list)
+    proposed_text: str = ""
     used_model: bool = False
     model_used: str = ""
     prompt_tokens: int = 0
@@ -206,11 +211,18 @@ def check_names(source: str, target: str, lexicon: list[LexiconEntry]) -> CheckF
     """Проверка 4: латиница и заглавные слова не выдуманы моделью.
 
     Слово с заглавной буквы (кроме начала предложения) и любая латиница в L2
-    должны встречаться во входе или быть канонической формой лексикона.
+    должны встречаться во входе или в лексиконе. Термин лексикона может состоять
+    из нескольких слов («Transaq Connector»): тогда его слова разрешены, если
+    термин целиком присутствует в L2.
     """
     allowed = {entry.canonical.casefold() for entry in lexicon}
     for entry in lexicon:
         allowed.update(variant.casefold() for variant in entry.variants)
+    target_folded = target.casefold()
+    # Слова многословных терминов разрешены, только если термин есть в L2 целиком.
+    for phrase in list(allowed):
+        if " " in phrase and phrase in target_folded:
+            allowed.update(phrase.split())
     source_folded = source.casefold()
     for word in _capitalized_words(target):
         folded = word.casefold()
@@ -309,8 +321,13 @@ def _apply_model_output(
     markers: list[str],
     lexicon: list[LexiconEntry],
 ) -> NormalizeOutcome:
-    """Применить вывод модели, если он прошёл автопроверки."""
+    """Применить вывод модели, если он прошёл автопроверки.
+
+    Отклонённый вывод сохраняется в `proposed_text`: без него нельзя понять,
+    что именно предложила модель и почему проверка сработала.
+    """
     normalized = str(data.get("normalized_text") or "").strip()
+    outcome.proposed_text = normalized
     quality = str(data.get("asr_quality") or "ok")
     if quality not in ASR_QUALITIES:
         quality = "doubtful"
@@ -324,7 +341,11 @@ def _apply_model_output(
     if failures:
         outcome.status = "rejected"
         outcome.failures = failures
-        outcome.changes = [*outcome.changes, *[{"type": "rejected", "check": item.check} for item in failures]]
+        outcome.changes = [
+            *outcome.changes,
+            *[{"type": "rejected", "check": item.check} for item in failures],
+            {"type": "model_output", "text": normalized},
+        ]
         logger.info(
             "LLM: реплика %d отклонена автопроверкой (%s)",
             outcome.utterance_id,
@@ -350,8 +371,18 @@ def _tokens(text: str) -> list[str]:
 
 
 def _capitalized_words(text: str) -> list[str]:
-    """Слова с заглавной буквы не в начале предложения, плюс латиница."""
-    found = list(_CAPITAL_RE.findall(text))
+    """Слова с заглавной буквы не в начале предложения, плюс латиница.
+
+    Заглавная в начале предложения — следствие расстановки пунктуации моделью,
+    а не выдуманное название: после «:», «—», ««», «(», перевода строки и
+    терминаторов такие слова не проверяются. Латиница проверяется всегда.
+    """
+    found: list[str] = []
+    for match in _CAPITAL_WORD_RE.finditer(text):
+        prefix = text[: match.start()].rstrip()
+        if not prefix or _SENTENCE_BOUNDARY_RE.fullmatch(prefix[-1]):
+            continue
+        found.append(match.group(0))
     for latin in _LATIN_RE.findall(text):
         if latin not in found:
             found.append(latin)

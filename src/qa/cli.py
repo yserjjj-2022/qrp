@@ -191,8 +191,10 @@ def cmd_review_terms(args: argparse.Namespace) -> int:
         conn.close()
     print(
         f"[{run_id}] review-terms: утверждено={len(result.approved)}, "
-        f"отклонено={len(result.rejected)}, пропущено={len(result.skipped)}"
+        f"вариантов={len(result.variants)}, отклонено={len(result.rejected)}, пропущено={len(result.skipped)}"
     )
+    for surface_form, canonical in sorted(result.variants.items()):
+        print(f"  вариант: {surface_form!r} -> {canonical}")
     return 0
 
 

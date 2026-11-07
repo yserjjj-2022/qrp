@@ -210,6 +210,44 @@ class TestChecks:
     def test_known_term_allowed(self) -> None:
         assert check_unknown_name("перевёл через приложение", "Перевёл через СБП.", ["СБП"]) is None
 
+    def test_capital_after_colon_allowed(self) -> None:
+        assert check_unknown_name("подключил терминал: работает", "Подключил терминал: Работает.") is None
+
+    def test_capital_after_dash_allowed(self) -> None:
+        assert check_unknown_name("счёт — брокерский", "Счёт — Брокерский.") is None
+
+    def test_capital_after_quote_allowed(self) -> None:
+        assert check_unknown_name("назвал «сбер»", "Назвал «Сбер».") is None
+
+    def test_capital_after_paren_allowed(self) -> None:
+        assert check_unknown_name("через api (быстро)", "Через API (Быстро).") is None
+
+    def test_capital_after_newline_allowed(self) -> None:
+        assert check_unknown_name("первая мысль", "Первая мысль.\nВторая мысль.") is None
+
+    def test_capital_at_start_allowed(self) -> None:
+        assert check_unknown_name("счёт открыт", "Счёт открыт.") is None
+
+    def test_latin_still_checked(self) -> None:
+        failure = check_unknown_name("пользуюсь приложением", "Пользуюсь SuperApp.")
+        assert failure is not None
+        assert failure.check == "names"
+
+    def test_substitution_still_rejected(self) -> None:
+        """Реальная подмена слова названием по-прежнему отклоняется."""
+        failure = check_unknown_name("я пользуюсь приложением брокера", "Я пользуюсь SuperApp брокера.")
+        assert failure is not None
+        assert failure.check == "names"
+
+    def test_multiword_term_allowed(self) -> None:
+        assert check_unknown_name("через транзак коннектор", "Через Transaq Connector.", ["Transaq Connector"]) is None
+
+    def test_multiword_term_partial_not_allowed(self) -> None:
+        """Отдельное слово многословного термина без самого термина не разрешено."""
+        failure = check_unknown_name("через коннектор", "Через Connector.")
+        assert failure is not None
+        assert failure.check == "names"
+
     def test_combined_checks(self) -> None:
         failures = run_checks(
             "не хочу, потому что 100 рублей",
@@ -289,6 +327,26 @@ class TestNormalizeUtterance:
         # удаляет только модель, поэтому здесь он сохраняется.
         assert "не помню" in outcome.text
         assert outcome.failures
+
+    def test_rejected_keeps_model_output(self) -> None:
+        """Отклонённый вывод модели сохраняется для разбора."""
+        provider = FakeProvider([_ok("Я помню, чтобы он ошибался.")])
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "Я не помню, чтобы он ошибался",
+            previous_question=None,
+            lexicon=_LEXICON,
+            markers=_MARKERS,
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        assert outcome.status == "rejected"
+        assert outcome.proposed_text == "Я помню, чтобы он ошибался."
+        entries = [item for item in outcome.changes if item.get("type") == "model_output"]
+        assert entries == [{"type": "model_output", "text": "Я помню, чтобы он ошибался."}]
 
     def test_garbled_quality_preserved(self) -> None:
         provider = FakeProvider([_ok("Там [неразборчиво] и лимиты.", quality="garbled")])

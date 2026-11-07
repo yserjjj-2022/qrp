@@ -312,6 +312,39 @@ class LexiconRepository:
         )
         return cursor.rowcount > 0
 
+    def add_variant(self, canonical: str, variant: str) -> bool:
+        """Добавить вариант ASR к термину как решение оператора.
+
+        Запись получает `source='review'`, поэтому повторный `load-project`
+        не затрёт добавленный вариант данными листа «Лексикон».
+
+        Returns:
+            True, если вариант добавлен; False, если он пуст, совпадает
+            с канонической формой или уже есть в списке.
+        """
+        value = variant.strip()
+        if not value or value.casefold() == canonical.casefold():
+            return False
+        row = self._conn.execute("SELECT variants_json FROM lexicon WHERE canonical = ?", (canonical,)).fetchone()
+        existing = [str(item) for item in json.loads(row[0] or "[]")] if row is not None else []
+        if any(item.casefold() == value.casefold() for item in existing):
+            return False
+        existing.append(value)
+        payload = json.dumps(existing, ensure_ascii=False)
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO lexicon (canonical, variants_json, definition, status, source)"
+                " VALUES (?, ?, NULL, 'approved', 'review')",
+                (canonical, payload),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE lexicon SET variants_json = ?, source = 'review', updated_at = CURRENT_TIMESTAMP"
+                " WHERE canonical = ?",
+                (payload, canonical),
+            )
+        return True
+
 
 class MarkerRepository:
     """Маркеры неуверенности."""
