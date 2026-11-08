@@ -245,28 +245,38 @@ class TestSpanValidation:
 class TestSegmentValidation:
     """Границы модели принимаются только при полном покрытии текста."""
 
-    def test_rejects_gap(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+    def test_rejects_unknown_chunk(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+        """Куска нет в тексте — ответ отклонён целиком, работает деление кодом."""
         conn, interview_id, _ids = seeded
-        provider = FakeProvider([_BINDINGS, {"fragments": [{"start": 0, "end": 5}, {"start": 9, "end": 20}]}])
+        provider = FakeProvider([_BINDINGS, {"fragments": ["Куска нет в тексте.", "И этого тоже."]}])
         result = structure_interview(conn, "R01", _settings(), provider, code_version="test")
         assert result.stats.rejected_segments >= 1
         assert _fragments_match_l2(conn, interview_id)
 
-    def test_rejects_overlap(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
-        conn, interview_id, _ids = seeded
-        provider = FakeProvider([_BINDINGS, {"fragments": [{"start": 0, "end": 10}, {"start": 5, "end": 20}]}])
-        result = structure_interview(conn, "R01", _settings(), provider, code_version="test")
-        assert result.stats.rejected_segments >= 1
-        assert _fragments_match_l2(conn, interview_id)
-
-    def test_accepts_valid_spans(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+    def test_rejects_reordered_chunks(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+        """Куски в обратном порядке не находятся последовательным поиском."""
         conn, interview_id, _ids = seeded
         respondent_id = conn.execute(
             "SELECT id FROM utterance WHERE interview_id = ? AND speaker_role = 'RESPONDENT' ORDER BY id LIMIT 1",
             (interview_id,),
         ).fetchone()[0]
         text = _l2_text(conn, int(respondent_id))
-        provider = FakeProvider([_BINDINGS, {"fragments": [{"start": 0, "end": len(text)}]}])
+        head, tail = text[:10], text[10:]
+        provider = FakeProvider([_BINDINGS, {"fragments": [tail, head]}])
+        result = structure_interview(conn, "R01", _settings(), provider, code_version="test")
+        assert result.stats.rejected_segments >= 1
+        assert _fragments_match_l2(conn, interview_id)
+
+    def test_accepts_text_chunks(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+        """Дословные куски превращаются в границы без участия модели в смещениях."""
+        conn, interview_id, _ids = seeded
+        respondent_id = conn.execute(
+            "SELECT id FROM utterance WHERE interview_id = ? AND speaker_role = 'RESPONDENT' ORDER BY id LIMIT 1",
+            (interview_id,),
+        ).fetchone()[0]
+        text = _l2_text(conn, int(respondent_id))
+        cut = text.index(". ") + 2 if ". " in text else len(text)
+        provider = FakeProvider([_BINDINGS, {"fragments": [text[:cut].strip(), text[cut:].strip()]}])
         result = structure_interview(conn, "R01", _settings(), provider, code_version="test")
         assert result.stats.rejected_segments == 0
         assert _fragments_match_l2(conn, interview_id)

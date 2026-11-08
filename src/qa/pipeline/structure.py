@@ -68,18 +68,7 @@ BIND_SCHEMA: dict[str, Any] = {
 SEGMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "fragments": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "start": {"type": "integer"},
-                    "end": {"type": "integer"},
-                },
-                "required": ["start", "end"],
-                "additionalProperties": False,
-            },
-        }
+        "fragments": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["fragments"],
     "additionalProperties": False,
@@ -88,6 +77,9 @@ SEGMENT_SCHEMA: dict[str, Any] = {
 # Кандидаты в промпте привязки: сколько ближайших вопросов показывать модели.
 CANDIDATES_PER_BLOCK = 3
 # Целевая длина фрагмента при детерминированном делении по предложениям.
+# Это не предел: жёсткая граница задана `m1c.max_fragment_chars` и проверяется
+# в `validate_spans`. Смешивать их нельзя — fallback группировал бы предложения
+# до 1200 символов и почти не резал реплики.
 _FALLBACK_TARGET_CHARS = 300
 _SENTENCE_END_RE = re.compile(r"[.!?…]+(?=\s|$)")
 
@@ -445,18 +437,51 @@ def validate_spans(spans: list[FragmentSpan], text_length: int, max_chars: int) 
     return None
 
 
-def spans_from_payload(payload: list[Any]) -> list[FragmentSpan] | None:
-    """Разобрать ответ модели в список границ; None — формат неверный."""
+def spans_from_payload(payload: list[Any], text: str) -> list[FragmentSpan] | None:
+    """Найти позиции фрагментов в тексте последовательным поиском.
+
+    Модель возвращает дословные куски текста, а не числовые границы: смещения
+    она считает ненадёжно (на реальном интервью последний `end` систематически
+    не доходил до конца текста). Позиции ищутся кодом.
+
+    Поиск идёт от конца предыдущего фрагмента, поэтому фрагменты не
+    пересекаются и не переставляются. Пробелы между кусками относятся к
+    предыдущему фрагменту: так текст покрывается целиком без дыр.
+
+    Returns:
+        Границы или None, если кусок не найден или порядок нарушен.
+    """
     spans: list[FragmentSpan] = []
+    cursor = 0
     for item in payload:
-        if not isinstance(item, dict):
+        if not isinstance(item, str):
             return None
-        start = item.get("start")
-        end = item.get("end")
-        if not isinstance(start, int) or not isinstance(end, int):
+        chunk = item.strip()
+        if not chunk:
             return None
-        spans.append(FragmentSpan(start=start, end=end))
+        position = text.find(chunk, cursor)
+        if position < 0:
+            return None
+        spans.append(FragmentSpan(position, position + len(chunk)))
+        cursor = position + len(chunk)
     return spans
+
+
+def _absorb_gaps(spans: list[FragmentSpan], text: str) -> list[FragmentSpan]:
+    """Расширить фрагменты на промежутки между кусками модели.
+
+    Модель возвращает смысловые куски без служебных пробелов на стыках. Пробел
+    между куском и следующим относится к предыдущему фрагменту, поэтому
+    фрагменты снова покрывают текст целиком без дыр. Первый фрагмент
+    начинается с нуля, последний доходит до конца текста.
+    """
+    if not spans:
+        return spans
+    result = [FragmentSpan(0, spans[0].end)]
+    for span in spans[1:]:
+        result.append(FragmentSpan(result[-1].end, span.end))
+    result[-1] = FragmentSpan(result[-1].start, len(text))
+    return result
 
 
 def fallback_spans(text: str, target_chars: int = _FALLBACK_TARGET_CHARS) -> list[FragmentSpan]:
@@ -589,7 +614,13 @@ def segment_utterance(
     settings: Settings,
     stats: StructureStats,
 ) -> list[FragmentSpan]:
-    """Получить границы фрагментов реплики: модель, иначе детерминированное деление."""
+    """Получить границы фрагментов реплики: модель, иначе детерминированное деление.
+
+    Модель возвращает список дословных кусков текста. Код находит их позиции
+    последовательным поиском и проверяет покрытие: кусок, которого нет в тексте
+    или который нарушает порядок, отклоняет ответ целиком, и применяется
+    деление по предложениям.
+    """
     text = utterance.l2_text or ""
     if not text.strip():
         return []
@@ -603,16 +634,20 @@ def segment_utterance(
             result = None
         if result is not None:
             stats.model_calls += 1
-            spans = spans_from_payload(result.data.get("fragments") or [])
+            spans = spans_from_payload(result.data.get("fragments") or [], text)
             if spans is not None:
+                spans = _absorb_gaps(spans, text)
                 reason = validate_spans(spans, len(text), max_chars)
                 if reason is None:
                     return spans
                 logger.info("LLM: границы реплики %d отклонены (%s)", utterance.id, reason)
                 stats.rejected_segments += 1
+            else:
+                logger.info("LLM: кусок реплики %d не найден в тексте, делю по предложениям", utterance.id)
+                stats.rejected_segments += 1
 
     stats.fallback_segments += 1
-    spans = fallback_spans(text, max_chars)
+    spans = fallback_spans(text)
     reason = validate_spans(spans, len(text), max_chars)
     if reason is not None:
         # Последний рубеж: жёсткая нарезка по пределу. Один фрагмент длиннее
