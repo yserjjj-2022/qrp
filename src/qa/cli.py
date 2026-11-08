@@ -191,7 +191,8 @@ def cmd_review_terms(args: argparse.Namespace) -> int:
         conn.close()
     print(
         f"[{run_id}] review-terms: утверждено={len(result.approved)}, "
-        f"вариантов={len(result.variants)}, отклонено={len(result.rejected)}, пропущено={len(result.skipped)}"
+        f"вариантов={len(result.variants)}, отклонено={len(result.rejected)}, пропущено={len(result.skipped)}, "
+        f"вне актуального L2={result.stale}"
     )
     for surface_form, canonical in sorted(result.variants.items()):
         print(f"  вариант: {surface_form!r} -> {canonical}")
@@ -374,6 +375,52 @@ def _export_review(settings: Settings, interview_code: str, version: int, run_id
     )
 
 
+def cmd_structure(args: argparse.Namespace) -> int:
+    """Привязать реплики к вопросам гайда и разбить L2 на фрагменты (M1c)."""
+    from qa.llm.errors import LlmConfigError, LlmError
+    from qa.pipeline.structure import StructureError, format_report, structure_interview
+    from qa.version import code_version
+
+    settings = _load_settings()
+    run_id = setup_logging(settings.log_level)
+
+    provider = None
+    if not args.no_model and settings.llm.provider != "stub":
+        from qa.llm import provider_from_settings
+
+        try:
+            provider = provider_from_settings(settings)
+        except LlmConfigError as exc:
+            print(f"[{run_id}] structure: ошибка настроек — {exc}")
+            return 1
+
+    conn = _open_db(settings)
+    try:
+        result = structure_interview(
+            conn,
+            args.interview,
+            settings,
+            provider,
+            l2_version=args.l2_version,
+            code_version=code_version(),
+            rebuild=args.rebuild,
+        )
+    except (StructureError, LlmError) as exc:
+        print(f"[{run_id}] structure: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    if result.skipped:
+        print(
+            f"[{run_id}] structure {result.interview_code}: фрагменты уже есть, повторная запись не нужна (--rebuild)"
+        )
+        return 0
+    for index, line in enumerate(format_report(result)):
+        print(f"[{run_id}] {line}" if index == 0 else line)
+    return 0
+
+
 def _settings_error_summary(exc: Exception) -> str:
     """Краткий текст ошибки настроек без значений полей."""
     from pydantic import ValidationError
@@ -437,6 +484,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_norm.add_argument("--new-version", action="store_true", help="Создать новую версию L2")
     p_norm.add_argument("--review-export", action="store_true", help="Выгрузить файл ручной проверки L2")
     p_norm.set_defaults(func=cmd_normalize)
+
+    p_struct = subparsers.add_parser("structure", help="Привязать реплики к вопросам гайда и разбить L2 (M1c)")
+    p_struct.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_struct.add_argument("--l2-version", type=int, help="Версия L2; по умолчанию последняя записанная")
+    p_struct.add_argument("--rebuild", action="store_true", help="Пересобрать привязку и фрагменты")
+    p_struct.add_argument("--no-model", action="store_true", help="Без вызовов модели: только правила кода")
+    p_struct.set_defaults(func=cmd_structure)
 
     return parser
 

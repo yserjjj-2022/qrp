@@ -274,11 +274,16 @@ class TestRebuildBlockers:
         transcript.write_text(_TRANSCRIPT, encoding="utf-8")
         _load(db, transcript, settings)
 
-        turn_id = db.execute("SELECT id FROM turn ORDER BY id LIMIT 1").fetchone()[0]
+        utterance_id = db.execute("SELECT id FROM utterance ORDER BY id LIMIT 1").fetchone()[0]
+        db.execute(
+            "INSERT INTO text_unit (utterance_id, text) VALUES (?, 'текст')",
+            (utterance_id,),
+        )
+        text_unit_id = db.execute("SELECT id FROM text_unit ORDER BY id LIMIT 1").fetchone()[0]
         code_id = db.execute("SELECT id FROM code LIMIT 1").fetchone()[0]
         cursor = db.execute(
-            "INSERT INTO fragment (turn_id, text) VALUES (?, ?)",
-            (turn_id, "фрагмент"),
+            'INSERT INTO fragment (utterance_id, text_unit_id, "start", "end", text) VALUES (?, ?, ?, ?, ?)',
+            (utterance_id, text_unit_id, 0, 5, "фрагмент"),
         )
         fragment_id = cursor.lastrowid
         db.execute(

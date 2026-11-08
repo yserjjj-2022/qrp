@@ -112,8 +112,23 @@ class M1bSettings(BaseModel):
         )
 
 
+class M1cSettings(BaseModel):
+    """Настройки привязки к вопросам и сегментации (M1c).
+
+    `min_similarity` — порог сходства реплики интервьюера с формулировкой
+    вопроса гайда на шаге подсказки. Значение ниже порога не связывает
+    реплику с вопросом: реплика остаётся кандидатом «вне гайда».
+    `max_fragment_chars` — верхняя граница длины фрагмента; более длинный
+    фрагмент считается ошибкой модели, а не поводом резать текст в коде.
+    """
+
+    min_similarity: float = Field(default=0.55, gt=0, le=1)
+    max_fragment_chars: int = Field(default=1200, ge=50)
+
+
 class GroupsSettings(BaseModel):
     """Канонические значения групп и их алиасы.
+
 
     Сравнение идёт по casefold: «ТОРГ», «торг», «Торгующие» дают одно значение.
     """
@@ -255,6 +270,7 @@ class Settings(BaseModel):
     vectors: VectorsSettings = VectorsSettings()
     pipeline: PipelineSettings = PipelineSettings()
     m1b: M1bSettings = M1bSettings()
+    m1c: M1cSettings = M1cSettings()
     workbook: WorkbookSettings = WorkbookSettings()
     groups: GroupsSettings = GroupsSettings()
     lexicon_status_map: dict[str, str] = Field(default_factory=dict)

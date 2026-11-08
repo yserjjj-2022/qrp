@@ -642,13 +642,17 @@ class InterviewRepository:
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
-    def annotation_refs_on_turns(self, interview_db_id: int) -> int:
-        """Сколько аннотаций ссылается на фрагменты записей интервью."""
+    def annotation_refs_on_utterances(self, interview_db_id: int) -> int:
+        """Сколько аннотаций ссылается на фрагменты реплик интервью.
+
+        Фрагмент (M1c) привязан к реплике `utterance`, а не к записи `turn`:
+        после миграции 0006 колонки `fragment.turn_id` больше нет.
+        """
         row = self._conn.execute(
             "SELECT COUNT(*) FROM annotation a"
             " JOIN fragment f ON a.fragment_id = f.id"
-            " JOIN turn t ON f.turn_id = t.id"
-            " WHERE t.interview_id = ?",
+            " JOIN utterance u ON f.utterance_id = u.id"
+            " WHERE u.interview_id = ?",
             (interview_db_id,),
         ).fetchone()
         return int(row[0]) if row is not None else 0
@@ -712,6 +716,57 @@ class NewTermRepository:
             "SELECT id, surface_form, context_utterance_id FROM new_term WHERE status = 'proposed' ORDER BY id"
         ).fetchall()
         return [(int(i), str(form), None if ctx is None else str(ctx)) for i, form, ctx in rows]
+
+    def proposed_on_current_l2(self) -> list[tuple[int, str, str | None]]:
+        """Кандидаты, форма которых есть в актуальной версии L2 своего интервью.
+
+        Актуальная версия локальна для интервью: у R01 это последняя записанная
+        версия R01, у другого интервью — своя. Сравнивать все кандидаты с одной
+        глобальной версией нельзя: тогда кандидаты интервью, обработанного более
+        новым пайплайном (одна версия), выпали бы из очереди.
+
+        Форма ищется по всему актуальному тексту интервью, а не только по
+        реплике-контексту: термин мог переехать в соседнюю реплику при
+        исправлении ASR, и терять его из очереди нельзя.
+
+        Сравнение идёт в Python через `casefold`: `lower()` в SQLite понимает
+        только ASCII, поэтому кириллица в SQL не понижается.
+
+        Кандидат без реплики-контекста остаётся в очереди: проверить нечем.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT n.id, n.surface_form, n.context_utterance_id, u.interview_id
+            FROM new_term n
+            LEFT JOIN utterance u ON u.id = n.context_utterance_id
+            WHERE n.status = 'proposed'
+            ORDER BY n.id
+            """
+        ).fetchall()
+
+        interview_texts: dict[int, str] = {}
+        for interview_id in {int(row[3]) for row in rows if row[3] is not None}:
+            units = self._conn.execute(
+                """
+                SELECT t.text FROM text_unit t JOIN utterance u ON u.id = t.utterance_id
+                WHERE u.interview_id = ? AND t.version = (
+                    SELECT MAX(t2.version) FROM text_unit t2
+                    JOIN utterance u2 ON u2.id = t2.utterance_id
+                    WHERE u2.interview_id = u.interview_id
+                )
+                """,
+                (interview_id,),
+            ).fetchall()
+            interview_texts[interview_id] = " ".join(str(unit[0]) for unit in units).casefold()
+
+        result: list[tuple[int, str, str | None]] = []
+        for term_id, form, context, interview_id in rows:
+            if context is None or interview_id is None:
+                result.append((int(term_id), str(form), None if context is None else str(context)))
+                continue
+            if str(form).casefold() in interview_texts.get(int(interview_id), ""):
+                result.append((int(term_id), str(form), str(context)))
+        return result
 
     def decide(self, term_id: int, decision: str) -> None:
         """Зафиксировать решение по кандидату."""
@@ -849,3 +904,199 @@ class RunRepository:
         """Последняя версия кодбука (для привязки прогона)."""
         row = self._conn.execute("SELECT id FROM codebook_version ORDER BY id DESC LIMIT 1").fetchone()
         return int(row[0]) if row is not None else None
+
+
+@dataclass(frozen=True)
+class GuideQuestion:
+    """Вопрос гайда, пригодный для привязки реплик."""
+
+    id: int
+    identifier: str
+    block: str | None
+    group: str | None
+    wording: str
+
+
+@dataclass(frozen=True)
+class UtteranceWithL2:
+    """Реплика интервью вместе с её L2 нужной версии."""
+
+    id: int
+    speaker_role: str
+    text: str
+    is_backchannel: bool
+    text_unit_id: int | None
+    l2_text: str | None
+    asr_quality: str | None
+
+
+@dataclass(frozen=True)
+class FragmentRow:
+    """Фрагмент L2 для записи в БД."""
+
+    utterance_id: int
+    text_unit_id: int
+    start: int
+    end: int
+    text: str
+    question_id: int | None
+    prior_interviewer_turn_id: int | None
+    asr_quality: str
+
+
+class StructureRepository:
+    """Привязка реплик к вопросам гайда и фрагменты L2 (M1c)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def guide_questions(self, codebook_version_id: int | None = None) -> list[GuideQuestion]:
+        """Вопросы гайда с непустой формулировкой.
+
+        Args:
+            codebook_version_id: версия кодбука; None — последняя загруженная.
+        """
+        version_id = codebook_version_id if codebook_version_id is not None else self.latest_codebook_version_id()
+        if version_id is None:
+            return []
+        rows = self._conn.execute(
+            'SELECT id, identifier, block, "group", wording FROM question'
+            " WHERE codebook_version_id = ? AND wording IS NOT NULL AND TRIM(wording) <> ''"
+            " ORDER BY id",
+            (version_id,),
+        ).fetchall()
+        return [
+            GuideQuestion(
+                id=int(qid),
+                identifier=str(identifier),
+                block=None if block is None else str(block),
+                group=None if group is None else str(group),
+                wording=str(wording),
+            )
+            for qid, identifier, block, group, wording in rows
+        ]
+
+    def latest_codebook_version_id(self) -> int | None:
+        """Последняя версия кодбука."""
+        row = self._conn.execute("SELECT id FROM codebook_version ORDER BY id DESC LIMIT 1").fetchone()
+        return int(row[0]) if row is not None else None
+
+    def utterances_with_l2(self, interview_db_id: int, version: int) -> list[UtteranceWithL2]:
+        """Реплики интервью в порядке транскрипта вместе с L2 заданной версии.
+
+        Реплики без L2 тоже возвращаются (`text_unit_id = None`): без L2
+        фрагментов нет, но привязка к вопросу у реплики интервьюера есть.
+        """
+        rows = self._conn.execute(
+            "SELECT u.id, u.speaker_role, u.text, u.is_backchannel, t.id, t.text, t.asr_quality"
+            " FROM utterance u"
+            " LEFT JOIN text_unit t ON t.utterance_id = u.id AND t.version = ?"
+            " WHERE u.interview_id = ?"
+            " ORDER BY u.id",
+            (version, interview_db_id),
+        ).fetchall()
+        return [
+            UtteranceWithL2(
+                id=int(uid),
+                speaker_role=str(role),
+                text=str(text),
+                is_backchannel=bool(flag),
+                text_unit_id=None if tu_id is None else int(tu_id),
+                l2_text=None if tu_text is None else str(tu_text),
+                asr_quality=None if quality is None else str(quality),
+            )
+            for uid, role, text, flag, tu_id, tu_text, quality in rows
+        ]
+
+    def last_turn_id(self, utterance_id: int) -> int | None:
+        """id последней записи транскрипта в реплике (для prior_interviewer_turn_id)."""
+        row = self._conn.execute("SELECT turn_ids FROM utterance WHERE id = ?", (utterance_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            values = json.loads(str(row[0]))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(values, list) or not values:
+            return None
+        last = values[-1]
+        return int(last) if isinstance(last, int) else None
+
+    def set_utterance_binding(
+        self,
+        utterance_id: int,
+        question_id: int | None,
+        is_probe: bool,
+        prior_interviewer_turn_id: int | None,
+    ) -> None:
+        """Записать привязку реплики к вопросу гайда."""
+        self._conn.execute(
+            "UPDATE utterance SET question_id = ?, is_probe = ?, prior_interviewer_turn_id = ? WHERE id = ?",
+            (question_id, int(is_probe), prior_interviewer_turn_id, utterance_id),
+        )
+
+    def clear_fragments(self, interview_db_id: int) -> int:
+        """Удалить фрагменты интервью перед пересборкой; вернуть число строк."""
+        cursor = self._conn.execute(
+            "DELETE FROM fragment WHERE utterance_id IN (SELECT id FROM utterance WHERE interview_id = ?)",
+            (interview_db_id,),
+        )
+        return int(cursor.rowcount)
+
+    def insert_fragment(self, row: FragmentRow) -> int:
+        """Записать фрагмент L2."""
+        cursor = self._conn.execute(
+            'INSERT INTO fragment (utterance_id, text_unit_id, "start", "end", text,'
+            " question_id, prior_interviewer_turn_id, asr_quality)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row.utterance_id,
+                row.text_unit_id,
+                row.start,
+                row.end,
+                row.text,
+                row.question_id,
+                row.prior_interviewer_turn_id,
+                row.asr_quality,
+            ),
+        )
+        new_id = cursor.lastrowid
+        if new_id is None:
+            msg = "SQLite не вернул id вставленной строки fragment"
+            raise sqlite3.Error(msg)
+        return int(new_id)
+
+    def fragments_of_interview(self, interview_db_id: int) -> list[tuple[int, int, int, str, int | None]]:
+        """Фрагменты интервью: (id, utterance_id, text_unit_id, text, question_id)."""
+        rows = self._conn.execute(
+            "SELECT f.id, f.utterance_id, f.text_unit_id, f.text, f.question_id"
+            " FROM fragment f JOIN utterance u ON f.utterance_id = u.id"
+            " WHERE u.interview_id = ? ORDER BY f.utterance_id, f.start",
+            (interview_db_id,),
+        ).fetchall()
+        return [
+            (int(fid), int(uid), int(tuid), str(text), None if qid is None else int(qid))
+            for fid, uid, tuid, text, qid in rows
+        ]
+
+    def fragment_l2_versions(self, interview_db_id: int) -> set[int]:
+        """Версии L2, на которые ссылаются записанные фрагменты интервью."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT t.version FROM fragment f"
+            " JOIN utterance u ON f.utterance_id = u.id"
+            " JOIN text_unit t ON f.text_unit_id = t.id"
+            " WHERE u.interview_id = ?",
+            (interview_db_id,),
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+
+    def utterances_per_question(self, interview_db_id: int) -> dict[str | None, int]:
+        """Сколько реплик респондента привязано к каждому вопросу (None — вне гайда)."""
+        rows = self._conn.execute(
+            "SELECT q.identifier, COUNT(*)"
+            " FROM utterance u LEFT JOIN question q ON u.question_id = q.id"
+            " WHERE u.interview_id = ? AND u.speaker_role = 'RESPONDENT'"
+            " GROUP BY q.identifier",
+            (interview_db_id,),
+        ).fetchall()
+        return {None if identifier is None else str(identifier): int(count) for identifier, count in rows}

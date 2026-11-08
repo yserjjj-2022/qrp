@@ -99,9 +99,9 @@ def _check_rebuild_allowed(repo: InterviewRepository, interview_db_id: int, inte
     text_units = repo.text_unit_refs_on_utterances(interview_db_id)
     if text_units:
         blockers.append(f"единицы L2 (text_unit): {text_units}")
-    annotations = repo.annotation_refs_on_turns(interview_db_id)
+    annotations = repo.annotation_refs_on_utterances(interview_db_id)
     if annotations:
-        blockers.append(f"аннотации на фрагменты записей: {annotations}")
+        blockers.append(f"аннотации на фрагменты реплик: {annotations}")
     if blockers:
         msg = (
             f"Интервью {interview_id}: пересборка реплик потеряет ссылки — "
