@@ -37,6 +37,7 @@ class ReviewResult:
     rejected: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     variants: dict[str, str] = field(default_factory=dict)
+    stale: int = 0
 
 
 def _ask(prompt: str) -> str:
@@ -81,17 +82,28 @@ def review_terms(
     форма записывается в лексикон с source='review'. Если указан канонический
     термин, форма становится его вариантом и заменяется детерминированным
     проходом, а не моделью.
+
+    В очередь попадают только кандидаты, чья форма есть в актуальной версии L2
+    своего интервью. Актуальная версия локальна для интервью: старые версии
+    R01 и единственная версия другого интервью равноправны. Кандидаты, которых
+    в актуальном тексте нет, не спрашиваются и остаются в статусе `proposed`;
+    их число выводится как `stale`.
     """
     ask_fn = ask or _ask
     ask_canonical_fn = ask_canonical or _ask
     terms_repo = NewTermRepository(conn)
     lexicon_repo = LexiconRepository(conn)
-    candidates = terms_repo.proposed()
+    all_candidates = terms_repo.proposed()
+    candidates = terms_repo.proposed_on_current_l2()
     if only is not None:
         allowed = {str(item) for item in only}
         candidates = [item for item in candidates if item[1] in allowed]
+        all_candidates = [item for item in all_candidates if item[1] in allowed]
 
-    result = ReviewResult()
+    result = ReviewResult(stale=len(all_candidates) - len(candidates))
+    if result.stale:
+        logger.info("review-terms: пропущено кандидатов вне актуального L2: %s", result.stale)
+
     for term_id, surface_form, context in candidates:
         context_note = f" (контекст: реплика {context})" if context else ""
         answer = ask_fn(f"Термин {surface_form!r}{context_note}: утвердить? [y/n/skip]: ")

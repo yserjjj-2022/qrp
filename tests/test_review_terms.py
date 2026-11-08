@@ -169,3 +169,98 @@ class TestReviewTerms:
 
         variants = LexiconRepository(db).all_terms()["MCP"]["variants"]
         assert "эсипи" in variants
+
+
+def _seed_interview(conn: sqlite3.Connection, code: str) -> int:
+    """Интервью с одной репликой-контекстом; возвращает id реплики."""
+    cursor = conn.execute("INSERT INTO interview (id_external, name) VALUES (?, 'тест')", (code,))
+    interview_id = int(cursor.lastrowid or 0)
+    cursor = conn.execute(
+        "INSERT INTO utterance (interview_id, speaker_role, text, turn_ids) VALUES (?, 'RESPONDENT', ?, '[]')",
+        (interview_id, "текст реплики"),
+    )
+    return int(cursor.lastrowid or 0)
+
+
+def _seed_l2(conn: sqlite3.Connection, utterance_id: int, version: int, text: str) -> None:
+    conn.execute(
+        "INSERT INTO text_unit (utterance_id, version, text) VALUES (?, ?, ?)",
+        (utterance_id, version, text),
+    )
+
+
+class TestCurrentL2Filter:
+    """Очередь review-terms: только формы из актуальной версии L2 своего интервью."""
+
+    def test_candidate_absent_from_current_l2_not_asked(self, db: sqlite3.Connection) -> None:
+        utterance_id = _seed_interview(db, "R01")
+        _seed_l2(db, utterance_id, 1, "Подключил эсипи Финам.")
+        _seed_l2(db, utterance_id, 2, "Подключил MCP Финам.")
+        NewTermRepository(db).add("эсипи", 1, utterance_id)
+        db.commit()
+
+        result = review_terms(db, ask=_answers([]))
+
+        assert result.stale == 1
+        assert result.approved == []
+        row = db.execute("SELECT status FROM new_term WHERE surface_form = 'эсипи'").fetchone()
+        assert row[0] == "proposed"
+
+    def test_candidate_present_in_current_l2_asked(self, db: sqlite3.Connection) -> None:
+        utterance_id = _seed_interview(db, "R01")
+        _seed_l2(db, utterance_id, 1, "Подключил эсипи Финам.")
+        _seed_l2(db, utterance_id, 2, "Подключил эсипи и MCP Финам.")
+        NewTermRepository(db).add("эсипи", 1, utterance_id)
+        db.commit()
+
+        result = review_terms(db, ask=_answers(["y MCP"]))
+
+        assert result.stale == 0
+        assert result.variants == {"эсипи": "MCP"}
+
+    def test_versions_are_compared_per_interview(self, db: sqlite3.Connection) -> None:
+        """У каждого интервью своя актуальная версия: v8 и v1 равноправны."""
+        first = _seed_interview(db, "R01")
+        second = _seed_interview(db, "R02")
+        for version in range(1, 9):
+            _seed_l2(db, first, version, "Актуальный текст первого интервью.")
+        _seed_l2(db, second, 1, "Актуальный текст второго интервью.")
+        NewTermRepository(db).add("первого", 1, first)
+        NewTermRepository(db).add("второго", 2, second)
+        db.commit()
+
+        result = review_terms(db, ask=_answers(["n", "n"]))
+
+        assert result.stale == 0
+        assert sorted(result.rejected) == ["второго", "первого"]
+
+    def test_form_found_in_adjacent_utterance(self, db: sqlite3.Connection) -> None:
+        """Термин переехал в соседнюю реплику при исправлении ASR — не теряем."""
+        first = _seed_interview(db, "R01")
+        cursor = db.execute(
+            "INSERT INTO utterance (interview_id, speaker_role, text, turn_ids)"
+            " SELECT interview_id, 'RESPONDENT', 'соседняя реплика', '[]' FROM utterance WHERE id = ?",
+            (first,),
+        )
+        neighbour = int(cursor.lastrowid or 0)
+        _seed_l2(db, first, 1, "Подключил что-то Финам.")
+        _seed_l2(db, neighbour, 1, "И ещё раз про MCP.")
+        NewTermRepository(db).add("MCP", 1, first)
+        db.commit()
+
+        result = review_terms(db, ask=_answers(["n"]))
+
+        assert result.stale == 0
+        assert result.rejected == ["MCP"]
+
+    def test_cyrillic_form_matched_case_insensitively(self, db: sqlite3.Connection) -> None:
+        """Сравнение не зависит от регистра кириллицы (SQLite lower() её не знает)."""
+        utterance_id = _seed_interview(db, "R01")
+        _seed_l2(db, utterance_id, 1, "Купил РЕПО на неделю.")
+        NewTermRepository(db).add("репо", 1, utterance_id)
+        db.commit()
+
+        result = review_terms(db, ask=_answers(["n"]))
+
+        assert result.stale == 0
+        assert result.rejected == ["репо"]
