@@ -258,9 +258,26 @@ class Settings(BaseModel):
     workbook: WorkbookSettings = WorkbookSettings()
     groups: GroupsSettings = GroupsSettings()
     lexicon_status_map: dict[str, str] = Field(default_factory=dict)
-    # Строка предметной области для промпта нормализации (ключ `domain_hint`).
-    # Сведений в L2 не добавляет: только помогает отличать термины от искажений.
+    # Строка предметной области для промпта нормализации. В репозитории пустая:
+    # текст содержит названия брокеров и продуктов и не должен публиковаться.
+    # Задаётся переменной окружения QA_DOMAIN_HINT или локальным
+    # `config.local.yaml` (в .gitignore). Сведений в L2 не добавляет: только
+    # помогает отличать термины от искажений ASR.
     domain_hint: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_domain_hint_env(cls, data: Any) -> Any:  # noqa: ANN401
+        """Перекрыть domain_hint переменной окружения QA_DOMAIN_HINT.
+
+        Переменная приоритетнее локального файла: значение задаёт оператор для
+        конкретного запуска. Пустая переменная не затирает файл.
+        """
+        merged: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
+        raw = os.environ.get("QA_DOMAIN_HINT")
+        if raw is not None and raw.strip():
+            merged["domain_hint"] = raw.strip()
+        return merged
 
     @model_validator(mode="before")
     @classmethod
@@ -334,20 +351,32 @@ class Settings(BaseModel):
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> Settings:
-        """Загрузить настройки из config.yaml + переменных окружения.
+        """Загрузить настройки из config.yaml + локального config.local.yaml + окружения.
+
+        `config.local.yaml` не коммитится: в нём лежат значения, которых не
+        должно быть в публичном репозитории (`domain_hint` с названиями
+        брокеров и продуктов). Значения из локального файла перекрывают
+        `config.yaml` поверхностно, по верхним ключам.
 
         `.env` читается вызывающей стороной (`load_env_file`) на входе CLI:
         библиотечный код не меняет окружение процесса неявно.
         """
-        data: dict[str, Any] = {}
         if config_path is None:
             config_path = Path("config.yaml")
-        if config_path.exists():
-            with open(config_path, encoding="utf-8") as f:
-                raw = yaml.safe_load(f)
-            if isinstance(raw, dict):
-                data = raw
+        data = _read_yaml(config_path)
+        # Локальный файл рядом с конфигом: значения, которых не должно быть в
+        # публичном репозитории. Отсутствие файла — норма, не ошибка.
+        data.update(_read_yaml(config_path.with_name("config.local.yaml")))
         return cls(**data)
+
+
+def _read_yaml(path: Path) -> dict[str, Any]:
+    """Прочитать YAML-файл в словарь; отсутствие файла и не-словарь дают пусто."""
+    if not path.is_file():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    return raw if isinstance(raw, dict) else {}
 
 
 def load_env_file(env_path: Path | None = None) -> None:

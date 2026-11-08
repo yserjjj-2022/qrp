@@ -20,6 +20,7 @@ from qa.llm.errors import LlmValidationError
 from qa.pipeline.normalize import NormalizeError, normalize_interview, plan_dry_run
 from qa.pipeline.normalize_l2 import (
     NORMALIZE_SCHEMA,
+    analyze_thought_loss,
     build_prompt,
     check_asr_fix,
     check_capital_words,
@@ -33,8 +34,16 @@ from qa.pipeline.normalize_l2 import (
     normalize_utterance,
     run_checks,
     should_use_model,
+    surviving_new_terms,
 )
-from qa.pipeline.normalize_rules import FuzzyConfig, LexiconEntry, normalize_deterministic, suspect_words
+from qa.pipeline.normalize_rules import (
+    FuzzyConfig,
+    LexiconEntry,
+    comparison_tokens,
+    is_service_word,
+    normalize_deterministic,
+    suspect_words,
+)
 from qa.settings import Settings
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -474,6 +483,215 @@ class TestAsrFix:
         assert check_asr_fix("мне это удобно", "Мне это удобно.", [], []) is None
 
 
+class TestSoftThoughtLoss:
+    """Мягкий исход: потеря служебного слова — doubtful, а не отказ."""
+
+    def test_service_word_loss_is_soft(self) -> None:
+        """«к» и «нам» исчезли — смысл цел, единица идёт в doubtful."""
+        result = analyze_thought_loss(
+            "Отчёт приходит к нам каждый день.",
+            "Отчёт приходит каждый день.",
+            [],
+        )
+        assert result.failure is None
+        assert result.soft
+
+    def test_content_word_loss_still_hard(self) -> None:
+        """Потеря смыслового слова остаётся отказом."""
+        result = analyze_thought_loss("Там балансировка и портфель", "Там портфель.", [])
+        assert result.failure is not None
+        assert result.failure.check == "thought_loss"
+
+    def test_same_check_function_still_rejects_content(self) -> None:
+        """Старая точка входа возвращает отказ только для смысловых потерь."""
+        assert check_thought_loss("Там балансировка и портфель", "Там портфель.", []) is not None
+        assert check_thought_loss("Там балансировка и портфель", "Там балансировка и портфель.", []) is None
+
+    def test_wide_service_set_covers_prepositions(self) -> None:
+        for word in ("к", "нам", "там", "если", "какой", "по-моему", "уже"):
+            assert is_service_word(word), word
+
+    def test_content_word_not_service(self) -> None:
+        for word in ("балансировка", "портфель", "акции"):
+            assert not is_service_word(word), word
+
+    def test_negation_loss_not_soft(self) -> None:
+        """«не» — служебное, но его потерю ловит отдельная жёсткая проверка."""
+        failures = run_checks("Он не торгует", "Он торгует.", _MARKERS, [])
+        assert any(f.check == "negations" for f in failures)
+
+    def test_soft_marks_unit_doubtful(self) -> None:
+        provider = FakeProvider([_ok("Отчёт приходит каждый день.")])
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "Отчёт приходит к нам каждый день",
+            previous_question=None,
+            lexicon=[],
+            markers=[],
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        assert outcome.status == "proposed"
+        assert outcome.asr_quality == "doubtful"
+        assert any(item.get("type") == "soft_thought_loss" for item in outcome.changes)
+
+    def test_soft_does_not_downgrade_garbled(self) -> None:
+        """`garbled` строже `doubtful`: мягкая пометка его не понижает."""
+        provider = FakeProvider([_ok("Там [неразборчиво] и лимиты.", quality="garbled")])
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "Там что-то и лимиты",
+            previous_question=None,
+            lexicon=[],
+            markers=[],
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        assert outcome.asr_quality == "garbled"
+
+
+class TestImplicitAsrFix:
+    """Молчаливое исправление искажения: дописать asr_fix и пометить doubtful."""
+
+    def test_unknown_word_with_close_known_replacement(self) -> None:
+        result = analyze_thought_loss(
+            "там на кое-как масштабируую сервис",
+            "Там кое-как масштабирую сервис.",
+            [],
+        )
+        assert result.failure is None
+        assert result.implicit_fixes
+        assert result.implicit_fixes[0][0] == "масштабируую"
+
+    def test_known_word_replacement_stays_hard(self) -> None:
+        """Обычное слово заменять нельзя: это подмена лексики, а не ASR."""
+        result = analyze_thought_loss(
+            "там балансировка портфеля",
+            "Там ребалансировка портфеля.",
+            [],
+        )
+        assert result.failure is not None
+        assert not result.implicit_fixes
+
+    def test_far_replacement_stays_hard(self) -> None:
+        """Замена искажения далёкой фразой — потеря смысла."""
+        result = analyze_thought_loss(
+            "тоже в Томсле получает",
+            "Тоже в том числе получает.",
+            [],
+        )
+        assert result.failure is not None
+
+    def test_implicit_fix_recorded_in_changes(self) -> None:
+        provider = FakeProvider([_ok("Там кое-как масштабирую сервис.")])
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "там на кое-как масштабируую сервис",
+            previous_question=None,
+            lexicon=[],
+            markers=[],
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        assert outcome.status == "proposed"
+        assert outcome.asr_quality == "doubtful"
+        fixes = [item for item in outcome.changes if item.get("type") == "asr_fix"]
+        assert fixes and fixes[0]["implicit"] is True
+        assert fixes[0]["from"] == "масштабируую"
+
+
+class TestComparisonTokens:
+    """Сравнение потерь устойчиво к дефисам и разной записи служебных слов."""
+
+    def test_hyphen_split(self) -> None:
+        assert comparison_tokens("робот-алгоритм") == ["робот", "алгоритм"]
+
+    def test_hyphen_not_a_loss(self) -> None:
+        result = analyze_thought_loss(
+            "там робот алгоритм работает",
+            "Там робот-алгоритм работает.",
+            [],
+        )
+        assert result.failure is None
+        assert not result.soft
+
+    def test_split_service_merge(self) -> None:
+        assert comparison_tokens("имею в виду") == ["имею", "ввиду"]
+
+    def test_merge_not_a_loss(self) -> None:
+        result = analyze_thought_loss(
+            "он имею ввиду алгоритм",
+            "Он имеет в виду алгоритм.",
+            [],
+        )
+        assert result.failure is None
+
+    def test_conjunction_variants(self) -> None:
+        assert comparison_tokens("чтоб вообще всё никогда") == ["что", "вообще", "все", "никогда"]
+
+    def test_conjunction_variant_not_a_loss(self) -> None:
+        result = analyze_thought_loss(
+            "кардинально что вообще всё никогда",
+            "Кардинально, чтоб вообще всё никогда.",
+            [],
+        )
+        assert result.failure is None
+
+    def test_phrase_repeat_collapsed(self) -> None:
+        """Дословный повтор фразы — механический дубль, а не потеря мысли."""
+        result = analyze_thought_loss(
+            "Он уже готов, он уже готов к сдаче.",
+            "Он уже готов к сдаче.",
+            [],
+        )
+        assert result.failure is None
+
+
+class TestSurvivingNewTerms:
+    """Пункт 3: в new_term остаются только формы, видимые в тексте."""
+
+    def test_term_in_l2_kept(self) -> None:
+        outcome = _outcome(text="Смотрел квик-дашборд.", proposed_text="Смотрел квик-дашборд.")
+        assert surviving_new_terms(outcome) == ["квик-дашборд"]
+
+    def test_term_only_in_rejected_output_kept(self) -> None:
+        """Искажение в отклонённом выводе осталось — человеку его нужно увидеть."""
+        outcome = _outcome(text="Смотрел квик-дашборд.", proposed_text="Смотрел квик-дашборд.")
+        assert surviving_new_terms(outcome) == ["квик-дашборд"]
+
+    def test_term_nowhere_dropped(self) -> None:
+        """Модель исправила слово и всё равно прислала его в new_terms."""
+        outcome = _outcome(text="Смотрел дашборд.", proposed_text="Смотрел дашборд.")
+        assert surviving_new_terms(outcome) == []
+
+    def test_case_insensitive(self) -> None:
+        outcome = _outcome(text="Смотрел Квик-дашборд.", proposed_text="")
+        assert surviving_new_terms(outcome) == ["квик-дашборд"]
+
+
+def _outcome(text: str, proposed_text: str, terms: list[str] | None = None) -> Any:  # noqa: ANN401
+    """Итог обработки реплики для проверки фильтра new_terms."""
+    from qa.pipeline.normalize_l2 import NormalizeOutcome
+
+    return NormalizeOutcome(
+        utterance_id=1,
+        text=text,
+        status="proposed",
+        asr_quality="ok",
+        new_terms=list(terms if terms is not None else ["квик-дашборд"]),
+        proposed_text=proposed_text,
+    )
+
+
 class TestNewWords:
     """Пункт 2: сравнение по лемам, а не по формам."""
 
@@ -828,6 +1046,28 @@ class TestNormalizeInterview:
         _seed_reference(db)
         provider = FakeProvider([_ok("Смотрел квик-дашборд в приложении.", new_terms=["квик-дашборд"])])
         result = normalize_interview(db, "R01", settings, provider)
+        assert result.stats.new_terms == 1
+        row = db.execute("SELECT surface_form FROM new_term").fetchone()
+        assert row is not None and row[0] == "квик-дашборд"
+
+    def test_new_term_dropped_when_not_in_text(self, db: sqlite3.Connection, settings: Settings) -> None:
+        """Модель исправила слово, но всё равно прислала его в new_terms."""
+        _seed_interview(db, [("RESPONDENT", "смотрел квик дашборд в приложении", 0)])
+        _seed_reference(db)
+        provider = FakeProvider([_ok("Смотрел дашборд в приложении.", new_terms=["квик-дашборд"])])
+        result = normalize_interview(db, "R01", settings, provider)
+        assert result.stats.new_terms == 0
+        assert db.execute("SELECT COUNT(*) FROM new_term").fetchone()[0] == 0
+
+    def test_new_term_kept_from_rejected_output(self, db: sqlite3.Connection, settings: Settings) -> None:
+        """В отклонённом выводе модели форма осталась — кандидат сохраняется."""
+        _seed_interview(db, [("RESPONDENT", "смотрел 100 дашбордов в приложении", 0)])
+        _seed_reference(db)
+        # Отказ по числам: в L2 останется детерминированный текст без формы,
+        # но в предложении модели кандидат есть.
+        provider = FakeProvider([_ok("Смотрел квик-дашборд в приложении.", new_terms=["квик-дашборд"])])
+        result = normalize_interview(db, "R01", settings, provider)
+        assert result.stats.rejected == 1
         assert result.stats.new_terms == 1
         row = db.execute("SELECT surface_form FROM new_term").fetchone()
         assert row is not None and row[0] == "квик-дашборд"

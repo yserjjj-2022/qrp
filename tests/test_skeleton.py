@@ -118,6 +118,53 @@ class TestSettings:
             Settings(db_path="data/test.db", log_level="INVALID")
 
 
+class TestDomainHint:
+    """Строка предметной области задаётся вне публичного конфига."""
+
+    def test_public_config_has_no_domain_hint(self, config_path: Path) -> None:
+        """В репозитории строка пустая: названия брокеров не публикуются.
+
+        Проверяется сам файл, а не результат слияния: локальный
+        config.local.yaml рядом намеренно содержит рабочую строку.
+        """
+        import yaml
+
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert payload["domain_hint"] == ""
+
+    def test_env_overrides(self) -> None:
+        with patch.dict(os.environ, {"QA_DOMAIN_HINT": "интервью про роботов"}, clear=False):
+            assert Settings.load().domain_hint == "интервью про роботов"
+
+    def test_empty_env_keeps_config(self, settings: Settings) -> None:
+        """Пустая переменная не затирает значение из конфига."""
+        with patch.dict(os.environ, {"QA_DOMAIN_HINT": "   "}, clear=False):
+            loaded = Settings.load(_project_root() / "config.yaml")
+        assert loaded.domain_hint == settings.domain_hint
+
+    def test_local_config_overrides(self, tmp_path: Path) -> None:
+        """config.local.yaml перекрывает config.yaml и не коммитится."""
+        config = tmp_path / "config.yaml"
+        config.write_text('domain_hint: ""\nlog_level: INFO\n', encoding="utf-8")
+        (tmp_path / "config.local.yaml").write_text(
+            'domain_hint: "локальная строка"\n',
+            encoding="utf-8",
+        )
+        assert Settings.load(config).domain_hint == "локальная строка"
+
+    def test_env_beats_local_config(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.yaml"
+        config.write_text('domain_hint: ""\n', encoding="utf-8")
+        (tmp_path / "config.local.yaml").write_text('domain_hint: "файл"\n', encoding="utf-8")
+        with patch.dict(os.environ, {"QA_DOMAIN_HINT": "окружение"}, clear=False):
+            assert Settings.load(config).domain_hint == "окружение"
+
+    def test_missing_local_config_is_fine(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.yaml"
+        config.write_text("log_level: INFO\n", encoding="utf-8")
+        assert Settings.load(config).domain_hint == ""
+
+
 class TestLogging:
     """Проверка настройки логирования."""
 

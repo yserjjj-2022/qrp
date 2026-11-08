@@ -31,6 +31,7 @@ from qa.pipeline.normalize_l2 import (
     prompt_hash,
     should_use_model,
     summarize,
+    surviving_new_terms,
     word_count,
 )
 from qa.pipeline.normalize_rules import LexiconEntry
@@ -225,7 +226,7 @@ def normalize_interview(
                 repeat_unclear=outcome.repeat_unclear,
                 run_id=run_id,
             )
-            for term in outcome.new_terms:
+            for term in surviving_new_terms(outcome):
                 new_terms.add(term, interview_db_id, outcome.utterance_id)
     except BaseException:
         conn.execute("ROLLBACK TO SAVEPOINT normalize_l2")

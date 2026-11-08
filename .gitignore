@@ -4,6 +4,9 @@
 # Environment secrets
 .env
 
+# Local config (domain hint with product names, personal paths)
+config.local.yaml
+
 # Data (transcripts, codebooks, backups)
 data/
 

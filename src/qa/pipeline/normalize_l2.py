@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from rapidfuzz import fuzz
+
 from qa.llm.base import LlmProvider
 from qa.llm.errors import LlmError, LlmValidationError
 from qa.pipeline.normalize_rules import (
@@ -27,6 +29,9 @@ from qa.pipeline.normalize_rules import (
     FILLER_PHRASES,
     FuzzyConfig,
     LexiconEntry,
+    comparison_tokens,
+    is_known_word,
+    is_service_word,
     lemma_of,
     normalize_deterministic,
     suspect_words,
@@ -73,6 +78,11 @@ NORMALIZE_SCHEMA: dict[str, Any] = {
 }
 
 ASR_QUALITIES = ("ok", "doubtful", "garbled")
+
+# Порог близости для молчаливого исправления ASR: модель заменила искажение
+# известным словом, но не записала `asr_fix`. Ниже порога замена считается
+# переписыванием смысла и остаётся жёстким отказом.
+IMPLICIT_ASR_THRESHOLD = 0.80
 
 _NEGATIONS = ("не", "нет", "ни", "без")
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
@@ -133,6 +143,8 @@ class NormalizeStats:
     new_terms: int = 0
     names_review: int = 0
     asr_fixes: int = 0
+    implicit_asr_fixes: int = 0
+    soft_thought_loss: int = 0
     fuzzy_replacements: int = 0
     glued_replacements: int = 0
     doubtful: int = 0
@@ -312,11 +324,14 @@ def _deleted_tokens(source: str, target: str) -> list[str]:
 
     Сравнение по лемам: «ноутбук» -> «ноутбука» — это словоформа, а не потеря
     мысли. У неизвестного словарю искажения лемма равна форме, поэтому замена
-    такого слова видна проверке.
+    такого слова видна проверке. Токенизация — `comparison_tokens`: дефисные
+    слова делятся на части, служебные сочетания и варианты союзов сводятся к
+    одной записи. Без этого «робот-алгоритм» выглядел бы как потеря «робот» и
+    «алгоритм», а «в виду» — как потеря «ввиду».
     """
-    remaining = Counter(lemma_of(token) for token in _tokens(target))
+    remaining = Counter(lemma_of(token) for token in comparison_tokens(target))
     missing: list[str] = []
-    for token in _tokens(source):
+    for token in comparison_tokens(source):
         lemma = lemma_of(token)
         if remaining.get(lemma, 0) > 0:
             remaining[lemma] -= 1
@@ -401,7 +416,8 @@ def _mechanical_repeat_counts(source: str) -> Counter[str]:
 
     Механический повтор служебного слова («и и», «они, они, они») можно
     схлопнуть: лишние вхождения не несут смысла. Ключ — лемма, как и в
-    остальных проверках потери мысли.
+    остальных проверках потери мысли. Повтор считается и для повторов фразы:
+    «там уже всё, там уже всё настроено» — тот же механический дубль.
     """
     extra: Counter[str] = Counter()
     matches = list(_WORD_RE.finditer(source))
@@ -414,24 +430,118 @@ def _mechanical_repeat_counts(source: str) -> Counter[str]:
     return extra
 
 
+def _repeat_ngram_counts(source: str, size: int) -> Counter[str]:
+    """Сколько раз n-грамм повторяется подряд (сверх первого вхождения).
+
+    Механический дубль бывает не только из одного слова: «там уже всё, там уже
+    всё» — повтор двух-трёх слов. Каждое вхождение повторённой фразы разрешает
+    удалить её слова один раз, ключ — лемма.
+    """
+    tokens = comparison_tokens(source)
+    extra: Counter[str] = Counter()
+    position = 0
+    while position <= len(tokens) - 2 * size:
+        left = tuple(tokens[position : position + size])
+        right = tuple(tokens[position + size : position + 2 * size])
+        if left == right:
+            for token in left:
+                extra[lemma_of(token)] += 1
+            position += size
+        else:
+            position += 1
+    return extra
+
+
+def _close_replacement(token: str, source: str, target: str) -> str | None:
+    """Известное слово L2, которым модель молча заменила искажение.
+
+    Модель исправляет ошибку ASR по контексту, но не всегда пишет `asr_fix` в
+    `changes`. Проверка видит только исчезновение искажённого слова и
+    отклоняет единицу, хотя смысл сохранён. Здесь ищется замена: исходное
+    слово обязано быть неизвестно словарю (иначе это подмена обычной лексики),
+    замена — известное слово, которого не было в L1, и совпадение не ниже
+    `IMPLICIT_ASR_THRESHOLD`.
+
+    Returns:
+        Замена в нижнем регистре или None, если близкой замены нет.
+    """
+    folded = token.casefold()
+    if is_known_word(token):
+        return None
+    source_tokens = set(comparison_tokens(source))
+    candidates = [word for word in set(comparison_tokens(target)) if word not in source_tokens]
+    best = ""
+    best_score = 0.0
+    for word in candidates:
+        if not is_known_word(word):
+            continue
+        score = fuzz.ratio(folded, word) / 100
+        if score > best_score:
+            best, best_score = word, score
+    if best_score < IMPLICIT_ASR_THRESHOLD:
+        return None
+    return best
+
+
 def check_thought_loss(source: str, target: str, changes: list[dict[str, Any]]) -> CheckFailure | None:
-    """Проверка 5: из L1 не исчезают слова, кроме паразитов и механических повторов.
+    """Проверка 5: из L1 не исчезают смысловые слова.
 
     Удаление принимается, если слово — паразит из списка (или звук), если это
-    лишнее вхождение подряд идущего повтора, либо если лемма слова есть среди
-    законных удалений из `changes`. Законность записи проверяет
-    `_declared_removals`: `filler` только для настоящей фразы-паразита,
-    `stutter` только для механического повтора, иначе модель могла бы объявить
-    удаление любого слова. Сравнение идёт по лемам: смена словоформы —
-    не потеря мысли. Любое другое исчезновение отклоняет единицу.
+    лишнее вхождение подряд идущего повтора (в том числе повтора фразы), либо
+    если лемма слова есть среди законных удалений из `changes`. Законность
+    записи проверяет `_declared_removals`: `filler` только для настоящей
+    фразы-паразита, `stutter` только для механического повтора, иначе модель
+    могла бы объявить удаление любого слова.
+
+    Потеря служебного слова (частица, союз, предлог, местоимение, вводное
+    наречие) и молчаливое исправление искажения ASR — не повод отклонять
+    единицу: такие случаи разбирает `analyze_thought_loss` и понижает её до
+    `doubtful`. Эта функция возвращает только жёсткий отказ.
+    """
+    return analyze_thought_loss(source, target, changes).failure
+
+
+@dataclass(frozen=True)
+class ThoughtLoss:
+    """Итог проверки потери мысли.
+
+    `failure` — жёсткий отказ (потеря смыслового слова). `soft` — потерянные
+    служебные слова, из-за которых единица становится `doubtful`.
+    `implicit_fixes` — молчаливые исправления искажений ASR: пары
+    «исходная форма -> замена», которые дописываются в `changes` как `asr_fix`.
+    """
+
+    failure: CheckFailure | None = None
+    soft: tuple[str, ...] = ()
+    implicit_fixes: tuple[tuple[str, str], ...] = ()
+
+
+def analyze_thought_loss(source: str, target: str, changes: list[dict[str, Any]]) -> ThoughtLoss:
+    """Разобрать исчезнувшие слова L1 на три класса.
+
+    1. Объяснённые: паразиты, звуки, механические повторы, законные записи
+       `changes` — пропускаются.
+    2. Служебные — дают `doubtful`, но не отказ: «там», «к», «если» смысла
+       не несут.
+    3. Искажения ASR, для которых в L2 нашлась близкая известная замена, —
+       тоже `doubtful`: модель исправила слово, но не записала `asr_fix`.
+
+    Всё остальное — жёсткий отказ: потеряно смысловое слово либо искажение
+    выброшено или заменено далёкой фразой.
     """
     deleted = _deleted_tokens(source, target)
     if not deleted:
-        return None
+        return ThoughtLoss()
     declared = _declared_removals(changes)
     declared.update(_phrase_filler_removals(source, target))
     repeats = _mechanical_repeat_counts(source)
-    unexplained: list[str] = []
+    for size in (2, 3):
+        for lemma, count in _repeat_ngram_counts(source, size).items():
+            repeats[lemma] = max(repeats[lemma], count)
+
+    soft: list[str] = []
+    implicit: list[tuple[str, str]] = []
+    hard: list[str] = []
     for token in deleted:
         if _is_filler_token(token):
             continue
@@ -442,10 +552,18 @@ def check_thought_loss(source: str, target: str, changes: list[dict[str, Any]]) 
         if declared.get(lemma, 0) > 0:
             declared[lemma] -= 1
             continue
-        unexplained.append(token)
-    if not unexplained:
-        return None
-    return CheckFailure("thought_loss", f"потеряны слова без основания: {len(unexplained)}")
+        if is_service_word(token):
+            soft.append(token)
+            continue
+        replacement = _close_replacement(token, source, target)
+        if replacement is not None:
+            implicit.append((token, replacement))
+            continue
+        hard.append(token)
+    failure = None
+    if hard:
+        failure = CheckFailure("thought_loss", f"потеряны слова без основания: {len(hard)}")
+    return ThoughtLoss(failure=failure, soft=tuple(soft), implicit_fixes=tuple(implicit))
 
 
 def _allowed_new_words(lexicon: list[LexiconEntry]) -> set[str]:
@@ -527,6 +645,21 @@ def check_asr_fix(
     return None
 
 
+@dataclass(frozen=True)
+class CheckReport:
+    """Итог автопроверок: жёсткие отказы и мягкие пометки.
+
+    `failures` отклоняют единицу. `soft_thought_loss` и `implicit_asr_fixes`
+    единицу не отклоняют: они переводят её в `doubtful`, чтобы человек
+    посмотрел реплику. Разделение нужно, потому что потеря служебного слова
+    или молчаливое исправление ASR — не выброшенный смысл.
+    """
+
+    failures: list[CheckFailure] = field(default_factory=list)
+    soft_thought_loss: tuple[str, ...] = ()
+    implicit_asr_fixes: tuple[tuple[str, str], ...] = ()
+
+
 def run_checks(
     source: str,
     target: str,
@@ -535,21 +668,39 @@ def run_checks(
     changes: list[dict[str, Any]] | None = None,
 ) -> list[CheckFailure]:
     """Выполнить жёсткие автопроверки вывода модели."""
+    return run_checks_detailed(source, target, markers, lexicon, changes).failures
+
+
+def run_checks_detailed(
+    source: str,
+    target: str,
+    markers: list[str],
+    lexicon: list[LexiconEntry],
+    changes: list[dict[str, Any]] | None = None,
+) -> CheckReport:
+    """Выполнить автопроверки и вернуть жёсткие отказы вместе с мягкими пометками."""
+    model_changes = changes or []
     failures: list[CheckFailure] = []
     for failure in (
         check_numbers(source, target),
         check_negations(source, target),
         check_uncertainty(source, target, markers),
         check_latin(source, target, lexicon),
-        check_asr_fix(source, target, lexicon, changes or []),
-        check_thought_loss(source, target, changes or []),
+        check_asr_fix(source, target, lexicon, model_changes),
     ):
         if failure is not None:
             failures.append(failure)
-    hard, _doubtful = check_new_words(source, target, lexicon, changes or [])
+    thought = analyze_thought_loss(source, target, model_changes)
+    if thought.failure is not None:
+        failures.append(thought.failure)
+    hard, _doubtful = check_new_words(source, target, lexicon, model_changes)
     if hard is not None:
         failures.append(hard)
-    return failures
+    return CheckReport(
+        failures=failures,
+        soft_thought_loss=thought.soft,
+        implicit_asr_fixes=thought.implicit_fixes,
+    )
 
 
 def normalize_utterance(
@@ -633,6 +784,16 @@ def normalize_utterance(
     return _apply_model_output(outcome, deterministic.text, result.data, markers, lexicon)
 
 
+def _at_least_doubtful(quality: str) -> str:
+    """Поднять оценку качества до `doubtful`, не понижая более тяжёлую.
+
+    `garbled` означает невосстановимый фрагмент и строже `doubtful`: мягкая
+    пометка (потеря служебного слова, молчаливое исправление ASR) не должна
+    «улучшать» такую единицу.
+    """
+    return quality if quality in ("doubtful", "garbled") else "doubtful"
+
+
 def _apply_model_output(
     outcome: NormalizeOutcome,
     deterministic_text: str,
@@ -655,7 +816,8 @@ def _apply_model_output(
     outcome.new_terms = [str(item).strip() for item in data.get("new_terms") or [] if str(item).strip()]
 
     model_changes = [item for item in data.get("changes") or [] if isinstance(item, dict)]
-    failures = run_checks(deterministic_text, normalized, markers, lexicon, model_changes)
+    report = run_checks_detailed(deterministic_text, normalized, markers, lexicon, model_changes)
+    failures = list(report.failures)
     if not normalized:
         failures.append(CheckFailure("empty", "модель вернула пустой текст"))
     if failures:
@@ -675,12 +837,33 @@ def _apply_model_output(
 
     outcome.changes = [*outcome.changes, *model_changes]
     outcome.text = normalized
+    if report.soft_thought_loss:
+        # Потеря служебных слов — сигнал человеку, а не отказ: «там», «к»,
+        # «если» смысла не несут. В L2 остаётся текст модели.
+        outcome.asr_quality = _at_least_doubtful(outcome.asr_quality)
+        outcome.changes = [
+            *outcome.changes,
+            {
+                "type": "soft_thought_loss",
+                "words": list(report.soft_thought_loss),
+            },
+        ]
+    if report.implicit_asr_fixes:
+        # Модель исправила искажение ASR по контексту, но не записала замену.
+        # Дописываем `asr_fix` сами: без записи следующий проход и ручная
+        # проверка не увидят, что слово изменено.
+        outcome.asr_quality = _at_least_doubtful(outcome.asr_quality)
+        for source_word, replacement in report.implicit_asr_fixes:
+            outcome.changes = [
+                *outcome.changes,
+                {"type": "asr_fix", "from": source_word, "to": replacement, "implicit": True},
+            ]
     _hard, new_doubtful = check_new_words(deterministic_text, normalized, lexicon, model_changes)
     if new_doubtful:
-        outcome.asr_quality = "doubtful"
+        outcome.asr_quality = _at_least_doubtful(outcome.asr_quality)
     names_failure = check_capital_words(deterministic_text, normalized, lexicon)
     if names_failure is not None:
-        outcome.asr_quality = "doubtful"
+        outcome.asr_quality = _at_least_doubtful(outcome.asr_quality)
         outcome.changes = [*outcome.changes, {"type": "names_review", "detail": names_failure.detail}]
     return outcome
 
@@ -714,6 +897,25 @@ def _capitalized_words(text: str) -> list[str]:
     return found
 
 
+def surviving_new_terms(outcome: NormalizeOutcome) -> list[str]:
+    """Кандидаты в новые термины, форма которых есть в тексте L2 или в выводе модели.
+
+    Кандидат имеет смысл, только если человек увидит форму в тексте. Модель
+    иногда присылает `new_terms` вместе с исправлением слова через `asr_fix`
+    или с переписанным фрагментом: в L2 такой формы нет, и лексикон засоряется.
+
+    Для отклонённой единицы в L2 остаётся детерминированный текст, а вывод
+    модели — в `proposed_text`. Отклонённый вывод не попадает в L2, но
+    искажение в нём осталось неисправленным, поэтому проверяются оба текста.
+    """
+    texts = [outcome.text.casefold()]
+    if outcome.proposed_text:
+        texts.append(outcome.proposed_text.casefold())
+    return [
+        term for term in outcome.new_terms if term.strip() and any(term.strip().casefold() in text for text in texts)
+    ]
+
+
 def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
     """Собрать счётчики по результатам обработки."""
     quality: dict[str, int] = {}
@@ -721,6 +923,8 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
     terms: dict[str, int] = {}
     names_review = 0
     asr_fixes = 0
+    implicit_asr_fixes = 0
+    soft_thought_loss = 0
     fuzzy_replacements = 0
     glued_replacements = 0
     for outcome in outcomes:
@@ -738,6 +942,10 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
                 names_review += 1
             elif change.get("type") == "asr_fix":
                 asr_fixes += 1
+                if change.get("implicit"):
+                    implicit_asr_fixes += 1
+            elif change.get("type") == "soft_thought_loss":
+                soft_thought_loss += 1
     return NormalizeStats(
         total=len(outcomes),
         proposed=sum(1 for item in outcomes if item.status == "proposed"),
@@ -750,9 +958,11 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
         repeat_unclear=sum(item.repeat_unclear for item in outcomes),
         term_replacements=terms,
         rejections=rejections,
-        new_terms=sum(len(item.new_terms) for item in outcomes),
+        new_terms=sum(len(surviving_new_terms(item)) for item in outcomes),
         names_review=names_review,
         asr_fixes=asr_fixes,
+        implicit_asr_fixes=implicit_asr_fixes,
+        soft_thought_loss=soft_thought_loss,
         fuzzy_replacements=fuzzy_replacements,
         glued_replacements=glued_replacements,
         doubtful=quality.get("doubtful", 0),

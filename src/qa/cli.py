@@ -344,7 +344,8 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     print(f"  замены по лексикону: {terms}")
     print(
         f"  fuzzy-замен={stats.fuzzy_replacements}, склеек={stats.glued_replacements}, "
-        f"asr_fix={stats.asr_fixes}, пометок названий={stats.names_review}"
+        f"asr_fix={stats.asr_fixes} (молчаливых={stats.implicit_asr_fixes}), "
+        f"мягкая потеря={stats.soft_thought_loss}, пометок названий={stats.names_review}"
     )
     print(f"  отказы автопроверок: {rejections}")
     print(f"  new_term={stats.new_terms}, токены: prompt={stats.prompt_tokens}, completion={stats.completion_tokens}")
