@@ -38,7 +38,7 @@ from qa.db.workbook_repo import (
 )
 from qa.llm.base import LlmProvider
 from qa.llm.errors import LlmError, LlmValidationError
-from qa.settings import Settings
+from qa.settings import Settings, normalize_group
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +250,7 @@ class StructureStats:
     fallback_segments: int = 0
     rejected_segments: int = 0
     per_question: dict[str | None, int] = field(default_factory=dict)
+    unanswered_questions: list[str] = field(default_factory=list)
     similarity_source: str = ""
     model_used_hint: str = ""
 
@@ -659,6 +660,60 @@ def segment_utterance(
     return spans
 
 
+def _count_probes(
+    blocks: list[Block],
+    bindings: dict[int, tuple[int | None, bool]],
+    utterances: list[UtteranceWithL2],
+) -> int:
+    """Сколько блоков — уточнение к вопросу гайда.
+
+    Чистое подтверждение интервьюера («Угу») уточнением не считается: оно
+    примыкает к содержательной реплике блока и своего вопроса не задаёт.
+    Блок без реплик интервьюера уточнением быть не может.
+    """
+    backchannel = {item.id for item in utterances if item.speaker_role == "INTERVIEWER" and item.is_backchannel}
+    probes = 0
+    for block in blocks:
+        _question_id, is_probe = bindings.get(block.index, (None, False))
+        if not is_probe:
+            continue
+        if any(utterance_id not in backchannel for utterance_id in block.interviewer_ids):
+            probes += 1
+    return probes
+
+
+def _question_applies(question_group: str | None, interview_group: str | None, universal: str) -> bool:
+    """Относится ли вопрос гайда к группе респондента.
+
+    Вопрос без группы и вопрос группы «Все» задаются любой группе. Вопрос
+    другой группы к этому респонденту не относится: его отсутствие в интервью
+    не пропуск. Группа-маркер задаётся в `config.yaml`, в коде не зашита.
+    """
+    if question_group is None or not question_group.strip():
+        return True
+    canonical = normalize_group(question_group)
+    if canonical == normalize_group(universal):
+        return True
+    return interview_group is not None and canonical == normalize_group(interview_group)
+
+
+def _unanswered_questions(
+    questions: list[GuideQuestion],
+    answered: set[str],
+    interview_group: str | None,
+    universal: str,
+) -> list[str]:
+    """Вопросы гайда, применимые к респонденту и не получившие ответа.
+
+    Порядок — как в гайде. Вопрос другой группы пропуском не считается.
+    """
+    return [
+        question.identifier
+        for question in questions
+        if _question_applies(question.group, interview_group, universal) and question.identifier not in answered
+    ]
+
+
 def structure_interview(
     conn: sqlite3.Connection,
     interview_code: str,
@@ -684,6 +739,7 @@ def structure_interview(
     if interview_db_id is None:
         msg = f"Интервью {interview_code} не найдено в БД: сначала загрузите транскрипт"
         raise StructureError(msg)
+    interview_group = InterviewRepository(conn).group_of(interview_db_id)
 
     text_units = TextUnitRepository(conn)
     version = l2_version if l2_version is not None else text_units.max_version_for_interview(interview_db_id)
@@ -819,8 +875,14 @@ def structure_interview(
     stats.fragments = len(fragments)
     stats.in_guide = sum(1 for question_id, _probe in bindings.values() if question_id is not None)
     stats.out_of_guide = sum(1 for question_id, _probe in bindings.values() if question_id is None)
-    stats.probes = sum(1 for _question_id, is_probe in bindings.values() if is_probe)
+    stats.probes = _count_probes(blocks, bindings, utterances)
     stats.per_question = structure.utterances_per_question(interview_db_id)
+    stats.unanswered_questions = _unanswered_questions(
+        questions,
+        {identifier for identifier in stats.per_question if identifier is not None},
+        interview_group,
+        settings.groups.universal,
+    )
     stats.similarity_source = stats.similarity_source or "—"
 
     logger.info(
@@ -888,6 +950,8 @@ def format_report(result: StructureResult) -> list[str]:
     ]
     for identifier, count in sorted(stats.per_question.items(), key=lambda pair: (pair[0] is None, pair[0] or "")):
         lines.append(f"    {identifier or 'вне гайда'}: {count}")
+    unanswered = ", ".join(stats.unanswered_questions) or "нет"
+    lines.append(f"  вопросы гайда без ответов респондента: {unanswered}")
     return lines
 
 

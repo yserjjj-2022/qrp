@@ -619,6 +619,11 @@ class InterviewRepository:
         row = self._conn.execute("SELECT id FROM interview WHERE id_external = ?", (interview_code,)).fetchone()
         return int(row[0]) if row is not None else None
 
+    def group_of(self, interview_db_id: int) -> str | None:
+        """Группа респондента интервью (None — не задана)."""
+        row = self._conn.execute('SELECT "group" FROM interview WHERE id = ?', (interview_db_id,)).fetchone()
+        return None if row is None or row[0] is None else str(row[0])
+
     def golden_refs_on_utterances(self, interview_db_id: int) -> int:
         """Сколько записей золотого набора ссылается на реплики интервью (utterance:<id>)."""
         rows = self._conn.execute("SELECT utterance_ref FROM golden_sample WHERE utterance_ref IS NOT NULL").fetchall()

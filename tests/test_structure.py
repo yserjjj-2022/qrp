@@ -21,6 +21,7 @@ from qa.pipeline.structure import (
     StructureError,
     build_segment_prompt,
     fallback_spans,
+    format_report,
     lexical_similarity,
     structure_interview,
 )
@@ -347,6 +348,35 @@ class TestQuestionBinding:
         assert flags[3] == 1
         assert rows_question(conn, 3) == ids["1"]
 
+    def test_backchannel_probe_not_counted(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+        """Блок из «Угу» и содержательной реплики — одно уточнение, а не два."""
+        conn, _interview_id, _ids = seeded
+        blocks = {
+            "blocks": [
+                {"block": 1, "question": "1", "is_probe": False},
+                {"block": 2, "question": "2", "is_probe": True},
+                {"block": 3, "question": None, "is_probe": False},
+            ]
+        }
+        result = structure_interview(conn, "R01", _settings(), FakeProvider([blocks]), code_version="test")
+        # В блоке 2 две реплики интервьюера: «Угу» (is_backchannel=1) и вопрос.
+        assert result.stats.probes == 1
+
+    def test_backchannel_probe_not_counted_in_report(
+        self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]
+    ) -> None:
+        conn, _interview_id, _ids = seeded
+        blocks = {
+            "blocks": [
+                {"block": 1, "question": "1", "is_probe": False},
+                {"block": 2, "question": "2", "is_probe": True},
+                {"block": 3, "question": None, "is_probe": False},
+            ]
+        }
+        result = structure_interview(conn, "R01", _settings(), FakeProvider([blocks]), code_version="test")
+        report = "\n".join(format_report(result))
+        assert "уточнений=1" in report
+
     def test_unknown_question_identifier_ignored(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
         conn, _interview_id, _ids = seeded
         bindings = {
@@ -365,6 +395,60 @@ class TestQuestionBinding:
         result = structure_interview(conn, "R01", _settings(), None, code_version="test")
         assert result.stats.similarity_source == "lexical"
         assert rows_question(conn, 1) == ids["1"]
+
+
+class TestUnansweredQuestions:
+    """Вопросы гайда без ответа: только применимые к группе респондента."""
+
+    def _seed_grouped_guide(self, conn: sqlite3.Connection) -> None:
+        """Гайд из трёх вопросов: «Все», «ТОРГ», «Все» (вместо _seed_guide)."""
+        cursor = conn.execute("INSERT INTO codebook_version (file_hash) VALUES ('h2')")
+        version_id = int(cursor.lastrowid or 0)
+        for identifier, group in (("1", "Все"), ("2", "ТОРГ"), ("3", "Все")):
+            conn.execute(
+                'INSERT INTO question (codebook_version_id, identifier, "group", wording) VALUES (?, ?, ?, ?)',
+                (version_id, identifier, group, f"Вопрос {identifier}?"),
+            )
+        conn.commit()
+
+    def test_question_of_other_group_is_not_a_gap(self, db: sqlite3.Connection) -> None:
+        interview_id = _seed_interview(db)
+        db.execute('UPDATE interview SET "group" = ? WHERE id = ?', ("Не торгующие", interview_id))
+        self._seed_grouped_guide(db)
+        _seed_l2(db, interview_id)
+
+        blocks = {
+            "blocks": [
+                {"block": 1, "question": "1", "is_probe": False},
+                {"block": 2, "question": None, "is_probe": False},
+                {"block": 3, "question": None, "is_probe": False},
+            ]
+        }
+        result = structure_interview(db, "R01", _settings(), FakeProvider([blocks]), code_version="test")
+
+        # Вопрос «2» группы ТОРГ к «Не торгующим» не относится — это не пропуск.
+        assert result.stats.unanswered_questions == ["3"]
+
+    def test_question_without_respondent_counts_as_unanswered(
+        self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]
+    ) -> None:
+        """Блок-хвост интервьюера без ответа не закрывает вопрос."""
+        conn, _interview_id, _ids = seeded
+        blocks = {
+            "blocks": [
+                {"block": 1, "question": "1", "is_probe": False},
+                {"block": 2, "question": "2", "is_probe": False},
+                {"block": 3, "question": "3", "is_probe": False},
+            ]
+        }
+        result = structure_interview(conn, "R01", _settings(), FakeProvider([blocks]), code_version="test")
+        assert result.stats.unanswered_questions == ["3"]
+
+    def test_report_lists_unanswered(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+        conn, _interview_id, _ids = seeded
+        result = structure_interview(conn, "R01", _settings(), FakeProvider([_BINDINGS]), code_version="test")
+        report = "\n".join(format_report(result))
+        assert "вопросы гайда без ответов респондента: 3" in report
 
 
 class TestLatestVersionOnly:

@@ -135,6 +135,9 @@ class GroupsSettings(BaseModel):
 
     canonical: list[str] = Field(default_factory=lambda: ["Все", "ТОРГ", "Не торгующие"])
     aliases: dict[str, list[str]] = Field(default_factory=dict)
+    # Группа-маркер «вопрос задаётся всем»: вопрос этой группы применим к любой
+    # группе респондента. Значение задаётся в config.yaml, в коде не зашито.
+    universal: str = "Все"
 
     def lookup(self) -> dict[str, str]:
         """Карта «нормализованный алиас -> каноническое значение»."""
