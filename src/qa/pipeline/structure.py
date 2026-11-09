@@ -241,7 +241,9 @@ class StructureStats:
     blocks: int = 0
     in_guide: int = 0
     out_of_guide: int = 0
+    main_blocks: int = 0
     probes: int = 0
+    blocks_without_interviewer: int = 0
     fragments: int = 0
     model_calls: int = 0
     model_bindings: int = 0
@@ -660,26 +662,50 @@ def segment_utterance(
     return spans
 
 
-def _count_probes(
+@dataclass(frozen=True)
+class BlockCategories:
+    """Непересекающиеся категории блоков по привязке к гайду.
+
+    Сумма равна числу блоков: «в гайде» отдельным счётчиком не выводится,
+    потому что включает и основные вопросы, и уточнения.
+    """
+
+    main: int
+    probes: int
+    out_of_guide: int
+    without_interviewer: int
+
+
+def _block_categories(
     blocks: list[Block],
     bindings: dict[int, tuple[int | None, bool]],
     utterances: list[UtteranceWithL2],
-) -> int:
-    """Сколько блоков — уточнение к вопросу гайда.
+) -> BlockCategories:
+    """Разложить блоки на непересекающиеся категории привязки.
 
-    Чистое подтверждение интервьюера («Угу») уточнением не считается: оно
-    примыкает к содержательной реплике блока и своего вопроса не задаёт.
-    Блок без реплик интервьюера уточнением быть не может.
+    Сначала отделяется блок вне гайда (модель не подтвердила вопрос), затем
+    блок без реплик интервьюера: он не может быть ни основным вопросом, ни
+    уточнением. Чистое подтверждение интервьюера («Угу») уточнением не
+    считается: оно примыкает к содержательной реплике блока.
     """
     backchannel = {item.id for item in utterances if item.speaker_role == "INTERVIEWER" and item.is_backchannel}
-    probes = 0
+    main = probes = out_of_guide = without_interviewer = 0
     for block in blocks:
-        _question_id, is_probe = bindings.get(block.index, (None, False))
-        if not is_probe:
-            continue
-        if any(utterance_id not in backchannel for utterance_id in block.interviewer_ids):
+        question_id, is_probe = bindings.get(block.index, (None, False))
+        if question_id is None:
+            out_of_guide += 1
+        elif not block.interviewer_ids:
+            without_interviewer += 1
+        elif is_probe and any(utterance_id not in backchannel for utterance_id in block.interviewer_ids):
             probes += 1
-    return probes
+        else:
+            main += 1
+    return BlockCategories(
+        main=main,
+        probes=probes,
+        out_of_guide=out_of_guide,
+        without_interviewer=without_interviewer,
+    )
 
 
 def _question_applies(question_group: str | None, interview_group: str | None, universal: str) -> bool:
@@ -873,9 +899,15 @@ def structure_interview(
     conn.commit()
 
     stats.fragments = len(fragments)
-    stats.in_guide = sum(1 for question_id, _probe in bindings.values() if question_id is not None)
-    stats.out_of_guide = sum(1 for question_id, _probe in bindings.values() if question_id is None)
-    stats.probes = _count_probes(blocks, bindings, utterances)
+    categories = _block_categories(blocks, bindings, utterances)
+    stats.main_blocks = categories.main
+    stats.probes = categories.probes
+    stats.out_of_guide = categories.out_of_guide
+    stats.blocks_without_interviewer = categories.without_interviewer
+    # «В гайде» — блоки, которым модель подтвердила вопрос. В отчёт эта сумма
+    # не идёт: там категории печатаются по отдельности, чтобы уточнения не
+    # смешивались с выходом за гайд.
+    stats.in_guide = categories.main + categories.probes + categories.without_interviewer
     stats.per_question = structure.utterances_per_question(interview_db_id)
     stats.unanswered_questions = _unanswered_questions(
         questions,
@@ -941,8 +973,9 @@ def format_report(result: StructureResult) -> list[str]:
         f"structure {result.interview_code} (L2 v{result.l2_version}): "
         f"реплик интервьюера={stats.interviewer}, респондента={stats.respondent}, "
         f"блоков вопрос-ответ={stats.blocks}, фрагментов={stats.fragments}",
-        f"  привязка: в гайде={stats.in_guide}, вне гайда={stats.out_of_guide}, "
-        f"уточнений={stats.probes}, неизвестных вопросов={stats.unknown_questions}, "
+        f"  привязка: основных={stats.main_blocks}, уточнений={stats.probes}, "
+        f"вне гайда={stats.out_of_guide}, без реплики интервьюера={stats.blocks_without_interviewer}, "
+        f"неизвестных вопросов={stats.unknown_questions}, "
         f"без ответа модели={stats.unbound_blocks}, сходство={stats.similarity_source}",
         f"  сегментация: отказов модели={stats.rejected_segments}, "
         f"делений по предложениям={stats.fallback_segments}, вызовов={stats.model_calls}",

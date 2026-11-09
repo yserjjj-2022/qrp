@@ -14,11 +14,13 @@ import pytest
 
 from qa.db.connection import get_connection
 from qa.db.migrations import migrate
-from qa.db.workbook_repo import StructureRepository
+from qa.db.workbook_repo import StructureRepository, UtteranceWithL2
 from qa.llm.base import LlmProvider, LlmResult
 from qa.llm.errors import LlmError
 from qa.pipeline.structure import (
     StructureError,
+    _block_categories,
+    build_blocks,
     build_segment_prompt,
     fallback_spans,
     format_report,
@@ -376,6 +378,64 @@ class TestQuestionBinding:
         result = structure_interview(conn, "R01", _settings(), FakeProvider([blocks]), code_version="test")
         report = "\n".join(format_report(result))
         assert "уточнений=1" in report
+
+    def test_report_splits_guide_blocks(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+        """Отчёт делит блоки на непересекающиеся категории, а не смешивает их."""
+        conn, _interview_id, _ids = seeded
+        blocks = {
+            "blocks": [
+                {"block": 1, "question": "1", "is_probe": False},
+                {"block": 2, "question": "2", "is_probe": True},
+                {"block": 3, "question": None, "is_probe": False},
+            ]
+        }
+        result = structure_interview(conn, "R01", _settings(), FakeProvider([blocks]), code_version="test")
+        report = "\n".join(format_report(result))
+        assert "основных=1" in report
+        assert "уточнений=1" in report
+        assert "вне гайда=1" in report
+        assert "без реплики интервьюера=0" in report
+        assert result.stats.main_blocks + result.stats.probes + result.stats.out_of_guide == result.stats.blocks
+
+    def test_block_without_interviewer_is_separate_category(self) -> None:
+        """Ответ без реплики интервьюера не становится основным вопросом гайда."""
+        utterances = [
+            UtteranceWithL2(
+                id=1,
+                speaker_role="RESPONDENT",
+                text="Отдельная мысль без вопроса.",
+                is_backchannel=False,
+                text_unit_id=1,
+                l2_text="Отдельная мысль без вопроса.",
+                asr_quality="ok",
+            ),
+            UtteranceWithL2(
+                id=2,
+                speaker_role="INTERVIEWER",
+                text="Как давно вы инвестируете?",
+                is_backchannel=False,
+                text_unit_id=2,
+                l2_text="Как давно вы инвестируете?",
+                asr_quality="ok",
+            ),
+            UtteranceWithL2(
+                id=3,
+                speaker_role="RESPONDENT",
+                text="Года три.",
+                is_backchannel=False,
+                text_unit_id=3,
+                l2_text="Года три.",
+                asr_quality="ok",
+            ),
+        ]
+        blocks = build_blocks(utterances)
+        # Модель привязала оба блока к вопросам гайда, но у первого нет интервьюера.
+        categories = _block_categories(blocks, {1: (1, False), 2: (1, False)}, utterances)
+        assert categories.main == 1
+        assert categories.without_interviewer == 1
+        assert categories.probes == 0
+        assert categories.out_of_guide == 0
+        assert categories.main + categories.without_interviewer == len(blocks)
 
     def test_unknown_question_identifier_ignored(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
         conn, _interview_id, _ids = seeded
