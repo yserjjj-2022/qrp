@@ -258,7 +258,12 @@ def require_reliability_attribute(conn: sqlite3.Connection) -> None:
         raise CodingError(msg)
     names = repository.attribute_names(version_id)
     if RELIABILITY_ATTRIBUTE not in names:
-        msg = f"В листе «Атрибуты» нет поля {RELIABILITY_ATTRIBUTE}: переименуйте атрибут в книге и выполните load-codebook"
+        found = ", ".join(sorted(names)) or "лист «Атрибуты» пуст"
+        msg = (
+            f"В загруженной версии кодбука (id={version_id}) нет поля {RELIABILITY_ATTRIBUTE}: "
+            f"в книге переименуйте атрибут уверенности, затем выполните load-codebook "
+            f"(сейчас в версии есть: {found})"
+        )
         raise CodingError(msg)
 
 

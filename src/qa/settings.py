@@ -247,6 +247,9 @@ class WorkbookSettings(BaseModel):
     """Классы листов и схемы колонок рабочей книги."""
 
     required_sheets: list[str] = Field(default_factory=list)
+    # Атрибуты разметки, без которых этап кодирования не начинается. Имена
+    # задаются в книге и перечисляются в config.yaml: в коде их списка нет.
+    required_attributes: list[str] = Field(default_factory=list)
     optional_sheets: list[str] = Field(default_factory=list)
     optional_prefixes: list[str] = Field(default_factory=list)
     ignored_sheets: list[str] = Field(default_factory=list)

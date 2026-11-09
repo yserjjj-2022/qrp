@@ -134,6 +134,31 @@ def _validate_codebook_rows(
     return code_rows, question_rows
 
 
+def _require_attributes(attributes_sheet: SheetData | None, required: list[str]) -> None:
+    """Проверить наличие обязательных атрибутов разметки в листе «Атрибуты».
+
+    Имена атрибутов задаёт оператор в книге; список обязательных — в
+    config.yaml (`workbook.required_attributes`). В коде имён нет: иначе
+    переименование в книге молча не совпало бы с проверкой.
+    """
+    if not required:
+        return
+    names = {
+        str(row.get("name")).strip()
+        for row in (attributes_sheet.rows if attributes_sheet is not None else [])
+        if row.get("name") is not None
+    }
+    missing = [name for name in required if name not in names]
+    if not missing:
+        return
+    found = ", ".join(sorted(names)) or "лист «Атрибуты» пуст"
+    msg = (
+        f"Лист '{SHEET_ATTRIBUTES}': нет обязательных атрибутов {', '.join(missing)}. "
+        f"Переименуйте поле в книге или добавьте его; сейчас есть: {found}"
+    )
+    raise CodebookValidationError(msg)
+
+
 def _build_tree_from_themes(
     theme_rows: list[dict[str, Any]],
     code_ids: dict[str, int],
@@ -272,6 +297,10 @@ def load_codebook(
     for warning in workbook.warnings:
         if warning.startswith("Неизвестный лист"):
             logger.warning(warning)
+
+    # Обязательные атрибуты проверяются всегда, в том числе при повторной
+    # загрузке: книга могла быть переименована, а версия уже записана.
+    _require_attributes(workbook.sheet(SHEET_ATTRIBUTES), workbook_settings.required_attributes)
 
     workbook_repo = WorkbookRepository(conn)
     codebook_repo = CodebookRepository(conn, groups)
