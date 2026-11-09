@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sqlite3
 from dataclasses import dataclass
 from typing import Any
@@ -910,6 +911,14 @@ class RunRepository:
         row = self._conn.execute("SELECT id FROM codebook_version ORDER BY id DESC LIMIT 1").fetchone()
         return int(row[0]) if row is not None else None
 
+    def set_model(self, run_id: int, model: str) -> None:
+        """Записать фактическую модель после вызовов.
+
+        Модель известна только из ответа API, а `run` создаётся до вызовов:
+        без обновления в прогоне остался бы пустой алиас.
+        """
+        self._conn.execute("UPDATE run SET model = ? WHERE id = ?", (model, run_id))
+
 
 @dataclass(frozen=True)
 class GuideQuestion:
@@ -1105,3 +1114,317 @@ class StructureRepository:
             (interview_db_id,),
         ).fetchall()
         return {None if identifier is None else str(identifier): int(count) for identifier, count in rows}
+
+    def set_fragment_quality(self, fragment_id: int, quality: str) -> None:
+        """Записать оценку качества фрагмента."""
+        self._conn.execute("UPDATE fragment SET asr_quality = ? WHERE id = ?", (quality, fragment_id))
+
+    def fragments_with_text(
+        self, interview_db_id: int
+    ) -> list[tuple[int, int, int, str, int, int, str, int | None, str]]:
+        """Фрагменты интервью: (id, utterance_id, text_unit_id, L2, start, end, текст, вопрос, качество)."""
+        rows = self._conn.execute(
+            'SELECT f.id, f.utterance_id, f.text_unit_id, t.text, f."start", f."end", f.text, f.question_id,'
+            " f.asr_quality"
+            " FROM fragment f"
+            " JOIN utterance u ON f.utterance_id = u.id"
+            " JOIN text_unit t ON f.text_unit_id = t.id"
+            " WHERE u.interview_id = ?"
+            " ORDER BY f.utterance_id, f.start",
+            (interview_db_id,),
+        ).fetchall()
+        return [
+            (
+                int(fid),
+                int(uid),
+                int(tuid),
+                str(unit_text),
+                int(start),
+                int(end),
+                str(frag_text),
+                None if qid is None else int(qid),
+                str(quality),
+            )
+            for fid, uid, tuid, unit_text, start, end, frag_text, qid, quality in rows
+        ]
+
+
+@dataclass(frozen=True)
+class CodeRow:
+    """Код текущей версии кодбука для промпта и проверок."""
+
+    id: int
+    name: str
+    family: str
+    title: str | None
+    definition: str | None
+    include: str | None
+    exclude: str | None
+    tiebreak_rule: str | None
+
+
+@dataclass(frozen=True)
+class FragmentCodingRow:
+    """Запись итога кодирования фрагмента."""
+
+    fragment_id: int
+    run_id: int
+    status: str
+    note: str | None
+
+
+@dataclass(frozen=True)
+class AnnotationRow:
+    """Аннотация для записи в БД."""
+
+    fragment_id: int
+    code_id: int
+    run_id: int
+    coding_id: int
+    rationale: str | None
+    quote: str
+    quote_start: int
+    quote_end: int
+    interpretation: str | None
+    interpretation_only: bool
+    order_kind: str | None
+    scenario: str | None
+    reliability: int | None
+    reliability_note: str | None
+    oth_description: str | None
+
+
+@dataclass(frozen=True)
+class ReviewRow:
+    """Строка выгрузки очереди ручной проверки."""
+
+    annotation_id: int
+    respondent_code: str | None
+    question_identifier: str | None
+    fragment_text: str
+    code_name: str
+    quote: str
+    order_kind: str | None
+    reliability: int | None
+    interpretation: str | None
+    interpretation_only: bool
+    oth_description: str | None
+
+
+class CodingRepository:
+    """Коды текущей версии, фрагменты и записи кодирования (M2)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def latest_codebook_version_id(self) -> int | None:
+        """Последняя версия кодбука."""
+        row = self._conn.execute("SELECT id FROM codebook_version ORDER BY id DESC LIMIT 1").fetchone()
+        return int(row[0]) if row is not None else None
+
+    def codes(self, codebook_version_id: int) -> list[CodeRow]:
+        """Активные коды версии кодбука."""
+        rows = self._conn.execute(
+            "SELECT id, name, family, title, definition, include, exclude, tiebreak_rule"
+            " FROM code WHERE codebook_version_id = ? AND status = 'active' ORDER BY id",
+            (codebook_version_id,),
+        ).fetchall()
+        return [
+            CodeRow(
+                id=int(code_id),
+                name=str(name),
+                family=str(family or ""),
+                title=None if title is None else str(title),
+                definition=None if definition is None else str(definition),
+                include=None if include is None else str(include),
+                exclude=None if exclude is None else str(exclude),
+                tiebreak_rule=None if tiebreak_rule is None else str(tiebreak_rule),
+            )
+            for code_id, name, family, title, definition, include, exclude, tiebreak_rule in rows
+        ]
+
+    def attribute_names(self, codebook_version_id: int) -> set[str]:
+        """Имена атрибутов разметки из листа «Атрибуты»."""
+        rows = self._conn.execute(
+            "SELECT name FROM attribute_definition WHERE codebook_version_id = ?",
+            (codebook_version_id,),
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def protected_fragments(self, interview_db_id: int) -> set[int]:
+        """Фрагменты, у которых есть принятая или исправленная аннотация.
+
+        Повторный прогон такие фрагменты не трогает (CONSTITUTION §6): новое
+        предложение рядом с принятым выглядело бы как второй код.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT a.fragment_id FROM annotation a"
+            " JOIN fragment f ON a.fragment_id = f.id"
+            " JOIN utterance u ON f.utterance_id = u.id"
+            " WHERE u.interview_id = ? AND a.status IN ('accepted', 'edited')",
+            (interview_db_id,),
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+
+    def clear_proposed(self, interview_db_id: int, run_id: int) -> None:
+        """Удалить предложенные аннотации фрагментов интервью перед повторной записью.
+
+        Принятое и исправленное не трогается (CONSTITUTION §6): удаляются только
+        аннотации в статусе `proposed` и только в рамках фрагментов интервью.
+        """
+        self._conn.execute(
+            "DELETE FROM annotation WHERE status = 'proposed' AND fragment_id IN ("
+            " SELECT f.id FROM fragment f JOIN utterance u ON f.utterance_id = u.id WHERE u.interview_id = ?)",
+            (interview_db_id,),
+        )
+        self._conn.execute(
+            "DELETE FROM fragment_coding WHERE run_id = ? AND fragment_id IN ("
+            " SELECT f.id FROM fragment f JOIN utterance u ON f.utterance_id = u.id WHERE u.interview_id = ?)",
+            (run_id, interview_db_id),
+        )
+
+    def insert_coding(self, row: FragmentCodingRow) -> int:
+        """Записать итог кодирования фрагмента."""
+        cursor = self._conn.execute(
+            "INSERT INTO fragment_coding (fragment_id, run_id, status, note) VALUES (?, ?, ?, ?)",
+            (row.fragment_id, row.run_id, row.status, row.note),
+        )
+        coding_id = cursor.lastrowid
+        if coding_id is None:
+            msg = "SQLite не вернул id вставленной строки fragment_coding"
+            raise sqlite3.Error(msg)
+        return int(coding_id)
+
+    def note_failure(self, coding_id: int, note: str) -> None:
+        """Дописать причину отказа в итог кодирования фрагмента."""
+        self._conn.execute(
+            "UPDATE fragment_coding SET status = 'failed', note = ? WHERE id = ?",
+            (note, coding_id),
+        )
+
+    def insert_annotation(self, row: AnnotationRow) -> int:
+        """Записать аннотацию фрагмента."""
+        cursor = self._conn.execute(
+            "INSERT INTO annotation (fragment_id, code_id, source, run_id, coding_id, rationale, quote,"
+            " quote_start, quote_end, interpretation, interpretation_only, order_kind, scenario,"
+            " reliability, reliability_note, oth_description, status)"
+            " VALUES (?, ?, 'llm', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed')",
+            (
+                row.fragment_id,
+                row.code_id,
+                row.run_id,
+                row.coding_id,
+                row.rationale,
+                row.quote,
+                row.quote_start,
+                row.quote_end,
+                row.interpretation,
+                int(row.interpretation_only),
+                row.order_kind,
+                row.scenario,
+                row.reliability,
+                row.reliability_note,
+                row.oth_description,
+            ),
+        )
+        annotation_id = cursor.lastrowid
+        if annotation_id is None:
+            msg = "SQLite не вернул id вставленной строки annotation"
+            raise sqlite3.Error(msg)
+        return int(annotation_id)
+
+    def review_queue(
+        self,
+        interview_db_id: int,
+        run_id: int,
+        sample_share: float,
+        *,
+        seed: int = 0,
+    ) -> list[tuple[int, str]]:
+        """Очередь ручной проверки: (annotation_id, причина).
+
+        Причины: `oth`, `unreliable`, `doubtful`, `pii`, `sample`. Аннотация
+        попадает в очередь целиком по любой причине; выборочная доля считается
+        по остатку, чтобы обязательные случаи не вытесняли выборку.
+        """
+        rows = self._conn.execute(
+            "SELECT a.id, a.interpretation_only, a.reliability, c.name, f.asr_quality, a.interpretation,"
+            " EXISTS (SELECT 1 FROM turn t, json_each(u.turn_ids) j"
+            "   WHERE t.id = j.value AND t.pii_flag = 1)"
+            " FROM annotation a"
+            " JOIN code c ON a.code_id = c.id"
+            " JOIN fragment f ON a.fragment_id = f.id"
+            " JOIN utterance u ON f.utterance_id = u.id"
+            " WHERE u.interview_id = ? AND a.run_id = ?"
+            " ORDER BY a.id",
+            (interview_db_id, run_id),
+        ).fetchall()
+        required: list[tuple[int, str]] = []
+        rest: list[int] = []
+        for ann_id, interpretation_only, reliability, code_name, quality, interpretation, pii in rows:
+            reasons: list[str] = []
+            if str(code_name) == "OTH":
+                reasons.append("oth")
+            if bool(interpretation_only) or (reliability is not None and int(reliability) == 1):
+                reasons.append("unreliable")
+            if str(quality) == "doubtful" and interpretation:
+                reasons.append("doubtful")
+            if bool(pii):
+                reasons.append("pii")
+            if reasons:
+                required.append((int(ann_id), ",".join(reasons)))
+            else:
+                rest.append(int(ann_id))
+
+        take = max(0, int(len(rest) * sample_share))
+        if take <= 0:
+            sampled: list[int] = []
+        elif take >= len(rest):
+            sampled = rest
+        else:
+            sampled = sorted(random.Random(seed).sample(rest, take))
+        return [*required, *[(ann_id, "sample") for ann_id in sampled]]
+
+    def review_export_rows(self, interview_db_id: int, run_id: int) -> list[ReviewRow]:
+        """Строки выгрузки ревью: аннотация, код респондента, вопрос, фрагмент, код и атрибуты."""
+        rows = self._conn.execute(
+            "SELECT a.id, i.respondent_code, q.identifier, f.text, c.name, a.quote, a.order_kind, a.reliability,"
+            " a.interpretation, a.interpretation_only, a.oth_description"
+            " FROM annotation a"
+            " JOIN fragment f ON a.fragment_id = f.id"
+            " JOIN utterance u ON f.utterance_id = u.id"
+            " JOIN interview i ON u.interview_id = i.id"
+            " JOIN code c ON a.code_id = c.id"
+            " LEFT JOIN question q ON f.question_id = q.id"
+            " WHERE u.interview_id = ? AND a.run_id = ?"
+            " ORDER BY u.id, f.start, a.id",
+            (interview_db_id, run_id),
+        ).fetchall()
+        return [
+            ReviewRow(
+                annotation_id=int(ann_id),
+                respondent_code=None if respondent_code is None else str(respondent_code),
+                question_identifier=None if identifier is None else str(identifier),
+                fragment_text=str(fragment_text),
+                code_name=str(code_name),
+                quote=str(quote),
+                order_kind=None if order_kind is None else str(order_kind),
+                reliability=None if reliability is None else int(reliability),
+                interpretation=None if interpretation is None else str(interpretation),
+                interpretation_only=bool(interpretation_only),
+                oth_description=None if oth_description is None else str(oth_description),
+            )
+            for (
+                ann_id,
+                respondent_code,
+                identifier,
+                fragment_text,
+                code_name,
+                quote,
+                order_kind,
+                reliability,
+                interpretation,
+                interpretation_only,
+                oth_description,
+            ) in rows
+        ]

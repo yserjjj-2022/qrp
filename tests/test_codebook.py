@@ -45,7 +45,7 @@ class TestLoadCodebook:
         assert result.counts["codes"] == 10
         assert result.counts["questions"] == 8
         assert result.counts["glossary"] == 2
-        assert result.counts["attributes"] == 2
+        assert result.counts["attributes"] == 3
 
     def test_question_code_links(self, db: sqlite3.Connection, tmp_path: Path, settings: Settings) -> None:
         path = build_workbook(tmp_path / "book.xlsx")

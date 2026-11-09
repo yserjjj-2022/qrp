@@ -126,6 +126,19 @@ class M1cSettings(BaseModel):
     max_fragment_chars: int = Field(default=1200, ge=50)
 
 
+class M2Settings(BaseModel):
+    """Настройки кодирования фрагментов (M2).
+
+    `prior_turns_limit` — сколько последних реплик интервьюера попадает в промпт
+    при определении признака ПОРЯДОК. `review_sample_share` — выборочная доля
+    очереди ручной проверки; обязательные случаи (OTH, ненадёжные, doubtful с
+    интерпретацией, pii) в неё не входят и проверяются целиком.
+    """
+
+    prior_turns_limit: int = Field(default=20, ge=1)
+    review_sample_share: float = Field(default=0.10, ge=0, le=1)
+
+
 class GroupsSettings(BaseModel):
     """Канонические значения групп и их алиасы.
 
@@ -274,6 +287,7 @@ class Settings(BaseModel):
     pipeline: PipelineSettings = PipelineSettings()
     m1b: M1bSettings = M1bSettings()
     m1c: M1cSettings = M1cSettings()
+    m2: M2Settings = M2Settings()
     workbook: WorkbookSettings = WorkbookSettings()
     groups: GroupsSettings = GroupsSettings()
     lexicon_status_map: dict[str, str] = Field(default_factory=dict)

@@ -421,6 +421,83 @@ def cmd_structure(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_code(args: argparse.Namespace) -> int:
+    """Закодировать фрагменты интервью кодами кодбука (M2)."""
+    from qa.llm.errors import LlmConfigError, LlmError
+    from qa.pipeline.coding import CodingError, code_interview, format_report, plan_dry_run
+    from qa.version import code_version
+
+    settings = _load_settings()
+    run_id = setup_logging(settings.log_level)
+    conn = _open_db(settings)
+    try:
+        if args.dry_run:
+            report = plan_dry_run(conn, args.interview, settings)
+            print(
+                f"[{run_id}] code dry-run {report.interview_code}: реплик={report.utterances}, "
+                f"фрагментов={report.fragments}, garbled={report.garbled}, doubtful={report.doubtful}, "
+                f"вызовов модели={report.model_calls}, оценка токенов промпта={report.prompt_tokens}, "
+                f"отправлено=0"
+            )
+            return 0
+
+        provider = None
+        if settings.llm.provider != "stub":
+            from qa.llm import provider_from_settings
+
+            try:
+                provider = provider_from_settings(settings)
+            except LlmConfigError as exc:
+                print(f"[{run_id}] code: ошибка настроек — {exc}")
+                return 1
+
+        result = code_interview(
+            conn,
+            args.interview,
+            settings,
+            provider,
+            code_version=code_version(),
+        )
+    except (CodingError, LlmError) as exc:
+        print(f"[{run_id}] code: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    for index, line in enumerate(format_report(result)):
+        print(f"[{run_id}] {line}" if index == 0 else line)
+    if args.review_export:
+        _export_coding_review(settings, result, run_id)
+    return 0
+
+
+def _export_coding_review(settings: Settings, result: object, run_id: str) -> None:
+    """Выгрузить очередь ручной проверки кодирования в data/exports."""
+    from qa.pipeline.coding_review import export_coding_review
+
+    interview_code = getattr(result, "interview_code", "")
+    run_db_id = getattr(result, "run_id", None)
+    if not isinstance(run_db_id, int):
+        print(f"[{run_id}] code: ручная проверка не выгружена — прогон не записан")
+        return
+    output = Path(settings.paths.exports) / f"coding_review_{interview_code}_run{run_db_id}.xlsx"
+    conn = _open_db(settings)
+    try:
+        review = export_coding_review(
+            conn,
+            interview_code,
+            run_db_id,
+            output,
+            sample_share=settings.m2.review_sample_share,
+        )
+    except ValueError as exc:
+        print(f"[{run_id}] code: ручная проверка не выгружена — {exc}")
+        return
+    finally:
+        conn.close()
+    print(f"[{run_id}] ручная проверка: {review.n_rows} строк -> {review.path}")
+
+
 def _settings_error_summary(exc: Exception) -> str:
     """Краткий текст ошибки настроек без значений полей."""
     from pydantic import ValidationError
@@ -491,6 +568,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_struct.add_argument("--rebuild", action="store_true", help="Пересобрать привязку и фрагменты")
     p_struct.add_argument("--no-model", action="store_true", help="Без вызовов модели: только правила кода")
     p_struct.set_defaults(func=cmd_structure)
+
+    p_code = subparsers.add_parser("code", help="Закодировать фрагменты интервью кодами кодбука (M2)")
+    p_code.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_code.add_argument("--dry-run", action="store_true", help="Посчитать объём работы без вызовов модели")
+    p_code.add_argument("--review-export", action="store_true", help="Выгрузить очередь ручной проверки")
+    p_code.set_defaults(func=cmd_code)
 
     return parser
 
