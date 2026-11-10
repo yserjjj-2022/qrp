@@ -12,7 +12,8 @@
 - Линт и формат: `uv run ruff check .` и `uv run ruff format .`
 - Проверка типов: `uv run mypy src` (тип-чекер: mypy)
 - Запуск пайплайна: `uv run qa-pipeline --help` (точка входа в `[project.scripts]`, реализация `src/qa/cli.py`)
-- Дашборд: `uv run qa-dashboard`
+- Дашборд: `uv run qa-pipeline dashboard <код интервью>` (HTML в `data/exports/`)
+- Отчёт: `uv run qa-pipeline report <код интервью>` (HTML в `data/reports/`)
 
 ## Структура
 - `src/qa/` код (`db/`, `pipeline/`, `llm/`, `vectors/`, `dashboard/`, `report/`, `settings.py`)
