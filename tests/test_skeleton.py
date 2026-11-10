@@ -95,7 +95,7 @@ class TestSettings:
         assert settings.log_level == "INFO"
 
     def test_llm_max_calls(self, settings: Settings) -> None:
-        assert settings.llm.max_calls_per_run == 100
+        assert settings.llm.max_calls_per_run == 200
 
     def test_api_key_not_required_when_stub(self) -> None:
         """При provider='stub' LLM_API_KEY не обязателен."""

@@ -581,8 +581,6 @@ def _build_annotation(
     reliability = min(reliability, cap)
 
     order = _normalize_order(payload.get("order"))
-    if order is None:
-        return None, "не указан признак ПОРЯДОК"
     scenario = _normalize_scenario(payload.get("scenario"), question_identifier)
 
     oth_description = payload.get("oth_description")
@@ -592,6 +590,13 @@ def _build_annotation(
 
     rationale = payload.get("rationale")
     note = payload.get("reliability_note")
+    note_text = None if note is None else str(note).strip() or None
+    if order is None:
+        # Пустой ПОРЯДОК не отменяет код: смысл фрагмента установлен, а признак
+        # спонтанности просто не определён. Аннотация остаётся, но проверяющий
+        # должен видеть, что атрибут не заполнен, — пометка идёт в note.
+        order_note = "ПОРЯДОК не указан моделью"
+        note_text = f"{note_text}; {order_note}" if note_text else order_note
     return (
         AnnotationRow(
             fragment_id=fragment.id,
@@ -607,7 +612,7 @@ def _build_annotation(
             order_kind=order,
             scenario=scenario,
             reliability=reliability,
-            reliability_note=None if note is None else str(note),
+            reliability_note=note_text,
             oth_description=oth_text,
         ),
         None,

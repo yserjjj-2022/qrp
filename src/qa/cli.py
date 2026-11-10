@@ -498,6 +498,29 @@ def _export_coding_review(settings: Settings, result: object, run_id: str) -> No
     print(f"[{run_id}] ручная проверка: {review.n_rows} строк -> {review.path}")
 
 
+def cmd_import_coding_review(args: argparse.Namespace) -> int:
+    """Записать решения ручной проверки кодирования и посчитать метрику."""
+    settings = _load_settings()
+    run_id = setup_logging(settings.log_level)
+    from qa.pipeline.coding_review import import_coding_review
+
+    path = Path(args.file)
+    conn = _open_db(settings)
+    try:
+        result = import_coding_review(conn, path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"[{run_id}] import-coding-review: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+    share = "—" if result.approved_share is None else f"{result.approved_share:.3f}"
+    print(
+        f"[{run_id}] решения ручной проверки: принято={result.approved}, исправлено={result.edited}, "
+        f"отклонено={result.rejected}, без решения={result.skipped}, доля принятых без правок={share}"
+    )
+    return 0
+
+
 def _settings_error_summary(exc: Exception) -> str:
     """Краткий текст ошибки настроек без значений полей."""
     from pydantic import ValidationError
@@ -574,6 +597,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_code.add_argument("--dry-run", action="store_true", help="Посчитать объём работы без вызовов модели")
     p_code.add_argument("--review-export", action="store_true", help="Выгрузить очередь ручной проверки")
     p_code.set_defaults(func=cmd_code)
+
+    p_coding_review = subparsers.add_parser(
+        "import-coding-review",
+        help="Записать решения ручной проверки кодирования и посчитать долю принятых без правок",
+    )
+    p_coding_review.add_argument("file", help="Заполненный xlsx очереди ручной проверки кодирования")
+    p_coding_review.set_defaults(func=cmd_import_coding_review)
 
     return parser
 

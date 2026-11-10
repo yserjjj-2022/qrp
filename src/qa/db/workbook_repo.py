@@ -17,6 +17,13 @@ from qa.settings import GroupsSettings, resolve_group
 
 logger = logging.getLogger(__name__)
 
+# Решение ручной проверки (`review.decision`) и статус аннотации, который оно ставит.
+_ANNOTATION_STATUS_BY_DECISION: dict[str, str] = {
+    "approved": "accepted",
+    "needs_revision": "edited",
+    "rejected": "rejected",
+}
+
 
 def _group_value(value: Any, groups: GroupsSettings | None) -> Any:
     """Каноническая группа; неизвестное значение сохраняется как есть с предупреждением."""
@@ -1202,7 +1209,9 @@ class ReviewRow:
     respondent_code: str | None
     question_identifier: str | None
     fragment_text: str
+    interviewer_context: str
     code_name: str
+    code_definition: str
     quote: str
     order_kind: str | None
     reliability: int | None
@@ -1388,8 +1397,8 @@ class CodingRepository:
     def review_export_rows(self, interview_db_id: int, run_id: int) -> list[ReviewRow]:
         """Строки выгрузки ревью: аннотация, код респондента, вопрос, фрагмент, код и атрибуты."""
         rows = self._conn.execute(
-            "SELECT a.id, i.respondent_code, q.identifier, f.text, c.name, a.quote, a.order_kind, a.reliability,"
-            " a.interpretation, a.interpretation_only, a.oth_description"
+            "SELECT a.id, u.id, i.respondent_code, q.identifier, f.text, c.name, c.title, c.definition,"
+            " a.quote, a.order_kind, a.reliability, a.interpretation, a.interpretation_only, a.oth_description"
             " FROM annotation a"
             " JOIN fragment f ON a.fragment_id = f.id"
             " JOIN utterance u ON f.utterance_id = u.id"
@@ -1400,31 +1409,84 @@ class CodingRepository:
             " ORDER BY u.id, f.start, a.id",
             (interview_db_id, run_id),
         ).fetchall()
-        return [
-            ReviewRow(
-                annotation_id=int(ann_id),
-                respondent_code=None if respondent_code is None else str(respondent_code),
-                question_identifier=None if identifier is None else str(identifier),
-                fragment_text=str(fragment_text),
-                code_name=str(code_name),
-                quote=str(quote),
-                order_kind=None if order_kind is None else str(order_kind),
-                reliability=None if reliability is None else int(reliability),
-                interpretation=None if interpretation is None else str(interpretation),
-                interpretation_only=bool(interpretation_only),
-                oth_description=None if oth_description is None else str(oth_description),
+        prior = self._prior_interviewer_context(interview_db_id)
+        result: list[ReviewRow] = []
+        for (
+            ann_id,
+            utterance_id,
+            respondent_code,
+            identifier,
+            fragment_text,
+            code_name,
+            code_title,
+            code_definition,
+            quote,
+            order_kind,
+            reliability,
+            interpretation,
+            interpretation_only,
+            oth_description,
+        ) in rows:
+            definition_parts = [str(part) for part in (code_title, code_definition) if part]
+            result.append(
+                ReviewRow(
+                    annotation_id=int(ann_id),
+                    respondent_code=None if respondent_code is None else str(respondent_code),
+                    question_identifier=None if identifier is None else str(identifier),
+                    fragment_text=str(fragment_text),
+                    interviewer_context=prior.get(int(utterance_id), ""),
+                    code_name=str(code_name),
+                    code_definition=": ".join(definition_parts),
+                    quote=str(quote),
+                    order_kind=None if order_kind is None else str(order_kind),
+                    reliability=None if reliability is None else int(reliability),
+                    interpretation=None if interpretation is None else str(interpretation),
+                    interpretation_only=bool(interpretation_only),
+                    oth_description=None if oth_description is None else str(oth_description),
+                )
             )
-            for (
-                ann_id,
-                respondent_code,
-                identifier,
-                fragment_text,
-                code_name,
-                quote,
-                order_kind,
-                reliability,
-                interpretation,
-                interpretation_only,
-                oth_description,
-            ) in rows
+        return result
+
+    def _prior_interviewer_context(self, interview_db_id: int) -> dict[int, str]:
+        """Последние одна-две содержательные реплики интервьюера перед каждой репликой.
+
+        Нужны проверяющему, чтобы увидеть, что спросил интервьюер: по ним
+        оценивается признак ПОРЯДОК. Берутся только не-бэкканальные реплики.
+        """
+        rows = self._conn.execute(
+            "SELECT id, speaker_role, text FROM utterance WHERE interview_id = ? ORDER BY id",
+            (interview_db_id,),
+        ).fetchall()
+        interviewer: list[tuple[int, str]] = [
+            (int(utterance_id), str(text)) for utterance_id, role, text in rows if str(role) == "INTERVIEWER"
         ]
+        result: dict[int, str] = {}
+        for utterance_id, role, _text in rows:
+            if str(role) != "RESPONDENT":
+                continue
+            before = [text for turn_id, text in interviewer if turn_id < int(utterance_id)][-2:]
+            result[int(utterance_id)] = " | ".join(before)
+        return result
+
+    def insert_review(
+        self,
+        annotation_id: int,
+        decision: str,
+        comment: str | None,
+        *,
+        reviewer: str | None = None,
+    ) -> int:
+        """Записать решение ручной проверки и перевести статус аннотации."""
+        cursor = self._conn.execute(
+            "INSERT INTO review (annotation_id, reviewer, decision, comment) VALUES (?, ?, ?, ?)",
+            (annotation_id, reviewer, decision, comment),
+        )
+        review_id = cursor.lastrowid
+        if review_id is None:
+            msg = "SQLite не вернул id вставленной строки review"
+            raise sqlite3.Error(msg)
+        self._conn.execute(
+            "UPDATE annotation SET status = ? WHERE id = ?",
+            (_ANNOTATION_STATUS_BY_DECISION[decision], annotation_id),
+        )
+        return int(review_id)

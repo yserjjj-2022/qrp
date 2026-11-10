@@ -10,7 +10,7 @@ import pytest
 from openpyxl import load_workbook
 
 from qa.pipeline.coding import code_interview
-from qa.pipeline.coding_review import COLUMNS, export_coding_review
+from qa.pipeline.coding_review import COLUMNS, export_coding_review, import_coding_review
 from qa.settings import Settings
 from tests.fixtures.coding_db import (
     ScriptedProvider,
@@ -119,6 +119,109 @@ class TestReviewQueue:
     def test_no_annotations_raises(self, seeded: Seeded) -> None:
         with pytest.raises(ValueError):
             export_coding_review(seeded.conn, "R01", 999, Path.cwd() / "empty.xlsx")
+
+
+class TestReviewExportColumns:
+    """Выгрузка содержит контекст интервьюера, определение кода и пустые колонки решения."""
+
+    def test_new_columns_filled(self, seeded: Seeded) -> None:
+        conn = seeded.conn
+        texts = fragment_texts(conn)
+        provider = ScriptedProvider([answer_for_fragments(texts, code="R1"), answer_for_fragments(texts, code="R1")])
+        result = code_interview(conn, "R01", _settings(), provider, code_version="test")
+        assert result.run_id is not None
+        output = Path.cwd() / "review_columns.xlsx"
+        export_coding_review(conn, "R01", result.run_id, output, sample_share=1.0)
+
+        workbook = load_workbook(output)
+        sheet = workbook["Проверка_кодов"]
+        rows = list(sheet.iter_rows(values_only=True))
+        headers = rows[0]
+        assert "реплика_интервьюера_перед_ответом" in headers
+        assert "определение_кода" in headers
+        assert "решение" in headers
+        assert "комментарий" in headers
+        first = rows[1]
+        context = first[headers.index("реплика_интервьюера_перед_ответом")]
+        assert "Что может пойти не так" in str(context)
+        definition = first[headers.index("определение_кода")]
+        assert "Ошибка модели" in str(definition) and "Модель ошибается" in str(definition)
+        assert first[headers.index("решение")] is None
+        assert first[headers.index("комментарий")] is None
+        output.unlink()
+
+
+class TestReviewImport:
+    """Импорт заполненного файла пишет решения в review и считает метрику."""
+
+    def _fill(self, path: Path, decisions: list[str | None]) -> None:
+        workbook = load_workbook(path)
+        sheet = workbook["Проверка_кодов"]
+        headers = [cell.value for cell in sheet[1]]
+        decision_index = headers.index("решение") + 1
+        comment_index = headers.index("комментарий") + 1
+        for offset, decision in enumerate(decisions, start=2):
+            sheet.cell(row=offset, column=decision_index, value=decision)
+            sheet.cell(row=offset, column=comment_index, value="проверено")
+        workbook.save(path)
+
+    def test_import_writes_decisions_and_share(self, seeded: Seeded) -> None:
+        conn = seeded.conn
+        texts = fragment_texts(conn)
+        provider = ScriptedProvider([answer_for_fragments(texts, code="R1"), answer_for_fragments(texts, code="R1")])
+        result = code_interview(conn, "R01", _settings(), provider, code_version="test")
+        assert result.run_id is not None
+        output = Path.cwd() / "review_import.xlsx"
+        export_coding_review(conn, "R01", result.run_id, output, sample_share=1.0)
+        self._fill(output, ["принято", "отклонено"])
+
+        imported = import_coding_review(conn, output)
+
+        assert imported.approved == 1
+        assert imported.edited == 0
+        assert imported.rejected == 1
+        assert imported.skipped == 0
+        assert imported.approved_share == 0.5
+        decisions = [row[0] for row in conn.execute("SELECT decision FROM review ORDER BY id").fetchall()]
+        assert decisions == ["approved", "rejected"]
+        statuses = {row[0] for row in conn.execute("SELECT status FROM annotation").fetchall()}
+        assert statuses == {"accepted", "rejected"}
+        output.unlink()
+
+    def test_empty_decision_is_skipped(self, seeded: Seeded) -> None:
+        conn = seeded.conn
+        texts = fragment_texts(conn)
+        provider = ScriptedProvider([answer_for_fragments(texts, code="R1"), answer_for_fragments(texts, code="R1")])
+        result = code_interview(conn, "R01", _settings(), provider, code_version="test")
+        assert result.run_id is not None
+        output = Path.cwd() / "review_empty.xlsx"
+        export_coding_review(conn, "R01", result.run_id, output, sample_share=1.0)
+
+        imported = import_coding_review(conn, output)
+
+        assert imported.skipped == 2
+        assert imported.decided == 0
+        assert imported.approved_share is None
+        assert conn.execute("SELECT COUNT(*) FROM review").fetchone()[0] == 0
+        output.unlink()
+
+    def test_unknown_decision_raises(self, seeded: Seeded) -> None:
+        conn = seeded.conn
+        texts = fragment_texts(conn)
+        provider = ScriptedProvider([answer_for_fragments(texts, code="R1"), answer_for_fragments(texts, code="R1")])
+        result = code_interview(conn, "R01", _settings(), provider, code_version="test")
+        assert result.run_id is not None
+        output = Path.cwd() / "review_bad.xlsx"
+        export_coding_review(conn, "R01", result.run_id, output, sample_share=1.0)
+        self._fill(output, ["может быть", None])
+
+        with pytest.raises(ValueError, match="Неизвестное решение"):
+            import_coding_review(conn, output)
+        output.unlink()
+
+    def test_missing_file(self) -> None:
+        with pytest.raises(FileNotFoundError):
+            import_coding_review(sqlite3.connect(":memory:"), Path.cwd() / "no_such_review.xlsx")
 
 
 class TestRerun:

@@ -70,11 +70,16 @@ class TestOrderPrompt:
         code_interview(seeded.conn, "R01", _settings(), provider, code_version="test")
         assert _orders(seeded.conn) == ["prompted", "spontaneous"]
 
-    def test_unknown_order_is_rejected(self, seeded: Seeded) -> None:
+    def test_unknown_order_is_kept_as_null(self, seeded: Seeded) -> None:
+        """Пустой ПОРЯДОК не отклоняет код: order_kind = NULL, пометка в note."""
         texts = fragment_texts(seeded.conn)
         provider = ScriptedProvider([answer_for_fragments(texts, order="maybe"), answer_for_fragments(texts)])
         result = code_interview(seeded.conn, "R01", _settings(), provider, code_version="test")
-        assert result.stats.rejections.get("не указан признак ПОРЯДОК", 0) >= 1
+        assert result.stats.rejections.get("не указан признак ПОРЯДОК", 0) == 0
+        rows = seeded.conn.execute("SELECT order_kind, reliability_note FROM annotation ORDER BY id").fetchall()
+        assert rows
+        assert rows[0][0] is None
+        assert "ПОРЯДОК не указан моделью" in str(rows[0][1])
 
     def test_category_is_content_not_family(self, seeded: Seeded) -> None:
         """Одна реплика: код «риск» подсказан, код «проверка» — нет.
