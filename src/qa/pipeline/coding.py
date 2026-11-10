@@ -487,7 +487,7 @@ def plan_dry_run(
         calls += 1
         prior = _prior_turns(conn, interview_db_id, item.id, prior_limit)
         prompt = build_coding_prompt(codes, _with_prior(item, prior))
-        prompt_tokens += max(1, len(prompt) // 4)
+        prompt_tokens += max(1, len(prompt) // 3)
     logger.debug("coding dry-run: L2 v%d, фрагментов=%d", version, total)
     return DryRunCodingReport(
         interview_code=interview_code,
@@ -939,6 +939,7 @@ def format_report(result: CodingResult) -> list[str]:
         f"doubtful с интерпретацией={stats.doubtful_with_interpretation}",
         f"  asr_quality по фрагментам: {quality}",
         f"  отказы аннотаций: {rejections}",
+        f"  токены: prompt={stats.prompt_tokens}, completion={stats.completion_tokens}",
     ]
     return lines
 
