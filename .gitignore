@@ -10,6 +10,11 @@ config.local.yaml
 # Data (transcripts, codebooks, backups)
 data/
 
+# Local databases outside data/
+*.sqlite
+*.sqlite3
+*.db
+
 # Cache
 __pycache__/
 *.pyc
