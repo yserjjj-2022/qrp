@@ -567,8 +567,53 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     accepted = report.quality.by_status.get("accepted", 0) + report.quality.by_status.get("edited", 0)
     print(
         f"[{run_id}] dashboard {report.interview_code}: тем={sum(len(node.themes) for node in report.nodes)}, "
-        f"принятых аннотаций={accepted}, кодов={report.codebook.used} из {report.codebook.total}, "
+        f"аннотаций={report.annotations_total} (проверено вручную {report.annotations_verified}), "
+        f"принятых={accepted}, кодов={report.codebook.used} из {report.codebook.total}, "
         f"run={report.run_id if report.run_id is not None else '—'} -> {output}"
+    )
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Собрать HTML-отчёт по интервью (M5)."""
+    from datetime import date
+
+    from qa.db.analytics_repo import AnalyticsRepository
+    from qa.pipeline.aggregate import AggregateError, build_coverage
+    from qa.report.model import build_report
+    from qa.report.render import render_report
+
+    settings = _load_settings()
+    run_id = setup_logging(settings.log_level)
+    conn = _open_db(settings)
+    try:
+        coverage = build_coverage(
+            conn,
+            args.interview,
+            settings.groups,
+            low_min=settings.m4.theme_low_min_annotations,
+            high_min=settings.m4.theme_high_min_annotations,
+            quotes_per_theme=settings.m4.quotes_per_theme,
+            quote_max_chars=settings.m4.quote_max_chars,
+        )
+        snapshot = args.snapshot_date or date.today().isoformat()
+        report = build_report(coverage, AnalyticsRepository(conn), snapshot_date=snapshot)
+    except AggregateError as exc:
+        print(f"[{run_id}] report: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    html = render_report(report)
+    default_name = f"report_{report.provenance.interview_code}.html"
+    output = Path(args.output) if args.output else Path(settings.paths.reports) / default_name
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(html, encoding="utf-8")
+
+    print(
+        f"[{run_id}] report {report.provenance.interview_code}: "
+        f"аннотаций={report.annotations_total} (проверено вручную {report.annotations_verified}), "
+        f"ограничений={len(report.limitations)}, прогонов={len(report.provenance.runs)} -> {output}"
     )
     return 0
 
@@ -652,6 +697,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_dash.add_argument("--output", help="Путь к HTML; по умолчанию data/exports/dashboard_<код>.html")
     p_dash.add_argument("--snapshot-date", help="Дата снимка чисел (ISO); по умолчанию сегодня")
     p_dash.set_defaults(func=cmd_dashboard)
+
+    p_report = subparsers.add_parser("report", help="HTML-отчёт по интервью (M5)")
+    p_report.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_report.add_argument("--output", help="Путь к HTML; по умолчанию data/reports/report_<код>.html")
+    p_report.add_argument("--snapshot-date", help="Дата снимка чисел (ISO); по умолчанию сегодня")
+    p_report.set_defaults(func=cmd_report)
 
     return parser
 

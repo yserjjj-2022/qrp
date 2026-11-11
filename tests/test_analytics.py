@@ -1,8 +1,9 @@
 """Тесты агрегации покрытия (M4).
 
-Проверяется то, что нельзя увидеть в БД без агрегации: попадание в счётчики
-только принятых аннотаций, границы статусов из конфига, применимость кодов по
-группе и список вопросов без ответа. Все данные синтетические.
+Проверяется то, что нельзя увидеть в БД без агрегации: в счётчики входят все
+аннотации, кроме отклонённых, ручная проверка выводится отдельным числом,
+границы статусов берутся из конфига, а список вопросов без ответа считается
+по фактически заданным вопросам. Все данные синтетические.
 """
 
 from __future__ import annotations
@@ -117,25 +118,44 @@ def test_status_boundaries_follow_config(settings: Settings) -> None:
     assert theme_status(high, low, high) == STATUS_HAS_DATA
 
 
-def test_only_accepted_and_edited_are_counted(tmp_path: Path, settings: Settings) -> None:
-    """`proposed` не входит в покрытие и выводится отдельным числом."""
+def test_proposed_annotations_are_counted(tmp_path: Path, settings: Settings) -> None:
+    """`proposed` входит в покрытие: выборочный контроль не является фильтром."""
     conn = _build(
         tmp_path,
         annotations=[AnnotationSpec(0, "R1", "про риски", status="accepted")],
     )
     report = _coverage(conn, settings)
     theme = report.nodes[0].themes[0]
-    assert theme.annotations == 1
-    assert report.quality.by_status["proposed"] == 2
-    assert report.quality.by_status["accepted"] == 1
+    assert theme.annotations == 3  # 1 accepted + 2 proposed
+    assert theme.verified == 1
+    assert report.annotations_total == 3
+    assert report.annotations_verified == 1
     conn.close()
 
 
-def test_edited_counts_as_accepted(tmp_path: Path, settings: Settings) -> None:
-    """Исправленная человеком аннотация участвует в агрегатах наравне с принятой."""
+def test_rejected_annotations_are_excluded(tmp_path: Path, settings: Settings) -> None:
+    """Отклонённая аннотация не входит ни в покрытие, ни в число проверенных."""
+    conn = _build(
+        tmp_path,
+        annotations=[
+            AnnotationSpec(0, "R1", "про риски", status="accepted"),
+            AnnotationSpec(1, "R1", "тоже риски", status="rejected"),
+        ],
+    )
+    report = _coverage(conn, settings)
+    assert report.annotations_total == 3  # 1 accepted + 2 proposed
+    assert report.annotations_verified == 1
+    assert report.nodes[0].themes[0].annotations == 3
+    conn.close()
+
+
+def test_edited_counts_as_verified(tmp_path: Path, settings: Settings) -> None:
+    """Исправленная человеком аннотация считается проверенной вручную."""
     conn = _build(tmp_path, annotations=[AnnotationSpec(0, "R1", "про риски", status="edited")])
     report = _coverage(conn, settings)
-    assert report.nodes[0].themes[0].annotations == 1
+    theme = report.nodes[0].themes[0]
+    assert theme.verified == 1
+    assert theme.annotations == 3
     conn.close()
 
 
@@ -165,24 +185,14 @@ def test_theme_without_codes_and_code_without_theme(tmp_path: Path, settings: Se
     conn.close()
 
 
-def test_code_applicability_by_question_group(tmp_path: Path, settings: Settings) -> None:
-    """Код с вопросами только чужой группы помечается как неприменимый."""
+def test_unused_codes_have_no_group_split(tmp_path: Path, settings: Settings) -> None:
+    """Неиспользованные коды идут одним списком по семьям, без деления по группе."""
     conn = _build(tmp_path)
     report = _coverage(conn, settings)
-    not_applicable = [entry for entry in report.codebook.unused if not entry.applicable]
-    applicable = [entry for entry in report.codebook.unused if entry.applicable]
-    assert [name for entry in not_applicable for name in entry.names] == ["E0"]
-    assert "V1" in [name for entry in applicable for name in entry.names]
-    assert report.codebook.unused_not_applicable == 1
-    conn.close()
-
-
-def test_oth_without_questions_is_applicable(tmp_path: Path, settings: Settings) -> None:
-    """Индуктивный код без вопросов считается применимым, а не чужим."""
-    conn = _build(tmp_path)
-    report = _coverage(conn, settings)
-    oth = [entry for entry in report.codebook.unused if "OTH" in entry.names]
-    assert oth and oth[0].applicable
+    unused_names = [name for entry in report.codebook.unused for name in entry.names]
+    assert sorted(unused_names) == ["A1", "E0", "OTH", "V1"]
+    families = [entry.family for entry in report.codebook.unused]
+    assert families == ["Проверка", "Ошибки исполнения", "Ответственность", "Индуктивный"]
     conn.close()
 
 
@@ -190,25 +200,25 @@ def test_oth_without_questions_is_applicable(tmp_path: Path, settings: Settings)
     "group",
     ["Не торгующие", "не торгующие", "не_торгующие", "не торг"],
 )
-def test_group_spelling_does_not_change_applicability(tmp_path: Path, settings: Settings, group: str) -> None:
+def test_group_spelling_does_not_change_result(tmp_path: Path, settings: Settings, group: str) -> None:
     """Регистр, пробелы, подчёркивания и алиас из конфига дают один результат."""
     conn = _build(tmp_path, group=group)
     report = _coverage(conn, settings)
-    assert report.codebook.unused_not_applicable == 1
-    assert report.quality.questions_without_answer == ("20",)
+    assert report.group == "Не торгующие"
+    assert report.quality.questions_without_answer == ("9Т", "20")
     conn.close()
 
 
-def test_questions_without_answer_skip_foreign_group(tmp_path: Path, settings: Settings) -> None:
-    """Вопросы чужой группы не попадают в список без ответа."""
+def test_questions_without_answer_ignore_group(tmp_path: Path, settings: Settings) -> None:
+    """Вопросы считаются по фактически заданным, без фильтра по группе."""
     conn = _build(tmp_path)
     report = _coverage(conn, settings)
-    assert report.quality.questions_without_answer == ("20",)
+    assert report.quality.questions_without_answer == ("9Т", "20")
     conn.close()
 
 
 def test_doubtful_share(tmp_path: Path, settings: Settings) -> None:
-    """Доля принятых аннотаций на doubtful-фрагментах считается отдельно."""
+    """Доля аннотаций на doubtful-фрагментах считается отдельно."""
     conn = _build(
         tmp_path,
         annotations=[
@@ -235,18 +245,17 @@ def test_cumulative_follows_utterance_order(tmp_path: Path, settings: Settings) 
     )
     report = _coverage(conn, settings)
     risks = report.nodes[0].themes[0]
-    assert risks.annotations == 2
     assert risks.distinct_codes == 1
-    assert risks.cumulative == (1, 1)
+    assert risks.cumulative == (1, 1, 1, 1)
     conn.close()
 
 
 def test_cumulative_codes_unit() -> None:
     """Функция накопления не зависит от БД и считает различные коды."""
-    from qa.db.analytics_repo import AcceptedAnnotationRow
+    from qa.db.analytics_repo import AnnotationRow
 
-    def row(code_id: int) -> AcceptedAnnotationRow:
-        return AcceptedAnnotationRow(
+    def row(code_id: int) -> AnnotationRow:
+        return AnnotationRow(
             id=code_id,
             code_id=code_id,
             fragment_id=1,
@@ -259,6 +268,8 @@ def test_cumulative_codes_unit() -> None:
             fragment_quality="ok",
             l2_text="",
             question_identifier=None,
+            verified=True,
+            interpretation_only=False,
         )
 
     assert cumulative_codes([]) == ()
@@ -314,13 +325,20 @@ def test_unknown_interview_raises(tmp_path: Path, settings: Settings) -> None:
 
 
 def test_interview_without_annotations(tmp_path: Path, settings: Settings) -> None:
-    """Интервью без принятых аннотаций агрегируется: все темы «нет данных»."""
-    conn = _build(tmp_path)
+    """Интервью без аннотаций агрегируется: все темы «нет данных»."""
+    conn = build_analytics_db(
+        tmp_path,
+        themes=THEMES,
+        codes=CODES,
+        questions=QUESTIONS,
+        interview=InterviewSpec(fragments=FRAGMENTS, questions={0: "8", 1: "9", 2: "13"}),
+    )
     report = _coverage(conn, settings)
     statuses = [theme.status for node in report.nodes for theme in node.themes]
     assert statuses and set(statuses) == {STATUS_NO_DATA}
     assert report.codebook.used == 0
     assert report.covered_fragments == 0
+    assert report.annotations_total == 0
     conn.close()
 
 

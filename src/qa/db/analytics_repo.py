@@ -24,6 +24,19 @@ class InterviewRow:
 
 
 @dataclass(frozen=True)
+class RunRow:
+    """Прогон для блока происхождения отчёта."""
+
+    id: int
+    started_at: str | None
+    model: str | None
+    prompt_hash: str | None
+    codebook_version_id: int | None
+    code_version: str | None
+    stage: str
+
+
+@dataclass(frozen=True)
 class CodingRunRow:
     """Прогон кодирования: версии кодбука и L2 и происхождение."""
 
@@ -74,8 +87,13 @@ class QuestionCodeRow:
 
 
 @dataclass(frozen=True)
-class AcceptedAnnotationRow:
-    """Принятая аннотация с контекстом цитаты и фрагмента."""
+class AnnotationRow:
+    """Аннотация с контекстом цитаты и фрагмента.
+
+    `verified` — признак ручной проверки: статус `accepted` или `edited`.
+    Непроверенные (`proposed`) входят в агрегаты наравне: выборочный контроль
+    не является фильтром, иначе числа описывают подвыборку, а не разметку.
+    """
 
     id: int
     code_id: int
@@ -89,6 +107,8 @@ class AcceptedAnnotationRow:
     fragment_quality: str
     l2_text: str
     question_identifier: str | None
+    verified: bool
+    interpretation_only: bool
 
 
 def run_stage(params: dict[str, Any]) -> str:
@@ -167,6 +187,47 @@ class AnalyticsRepository:
             stage=run_stage(params),
         )
 
+    def interview_runs(self, interview_id: int) -> list[RunRow]:
+        """Прогоны, которые затрагивали это интервью, в порядке запуска.
+
+        Прогон относится к интервью, если оставил след в его данных: запись
+        фрагментов (`fragment`), статусы фрагментов (`fragment_coding`) или
+        аннотации. Отбор по данным, а не по времени: глобальный прогон другого
+        интервью в блок происхождения не попадает.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT r.id, r.started_at, r.model, r.prompt_hash, r.codebook_version_id,
+                   r.code_version, r.params_json
+              FROM run r
+             WHERE r.id IN (
+                     SELECT fc.run_id FROM fragment_coding fc
+                       JOIN fragment f ON f.id = fc.fragment_id
+                       JOIN utterance u ON u.id = f.utterance_id
+                      WHERE u.interview_id = :iid
+                     UNION
+                     SELECT a.run_id FROM annotation a
+                       JOIN fragment f ON f.id = a.fragment_id
+                       JOIN utterance u ON u.id = f.utterance_id
+                      WHERE u.interview_id = :iid AND a.run_id IS NOT NULL
+             )
+             ORDER BY r.id
+            """,
+            {"iid": interview_id},
+        ).fetchall()
+        return [
+            RunRow(
+                id=int(row[0]),
+                started_at=None if row[1] is None else str(row[1]),
+                model=None if row[2] is None else str(row[2]),
+                prompt_hash=None if row[3] is None else str(row[3]),
+                codebook_version_id=None if row[4] is None else int(row[4]),
+                code_version=None if row[5] is None else str(row[5]),
+                stage=run_stage(_parse_params(None if row[6] is None else str(row[6]))),
+            )
+            for row in rows
+        ]
+
     def latest_codebook_version_id(self) -> int | None:
         """Последняя загруженная версия кодбука."""
         row = self._conn.execute("SELECT id FROM codebook_version ORDER BY id DESC LIMIT 1").fetchone()
@@ -225,26 +286,31 @@ class AnalyticsRepository:
         ).fetchall()
         return [QuestionCodeRow(question_id=int(row[0]), code_id=int(row[1])) for row in rows]
 
-    def accepted_annotations(self, interview_db_id: int) -> list[AcceptedAnnotationRow]:
-        """Принятые и исправленные аннотации интервью по порядку реплик.
+    def annotations(self, interview_db_id: int) -> list[AnnotationRow]:
+        """Все аннотации интервью, кроме отклонённых, по порядку реплик.
+
+        База агрегатов — вся разметка модели без `rejected`: выборочный контроль
+        не отбрасывает непроверенное. Признак проверки выводится отдельной
+        колонкой, а не фильтром.
 
         Текст цитаты берётся из L2 той версии, на которой построены фрагменты:
         позиции `quote_start`/`quote_end` относятся к ней, а не к L1.
         """
         rows = self._conn.execute(
             'SELECT a.id, a.code_id, a.fragment_id, f.utterance_id, f."start", a.quote,'
-            " a.quote_start, a.quote_end, a.reliability, f.asr_quality, t.text, q.identifier"
+            " a.quote_start, a.quote_end, a.reliability, f.asr_quality, t.text, q.identifier,"
+            " a.status, a.interpretation_only"
             " FROM annotation a"
             " JOIN fragment f ON f.id = a.fragment_id"
             " JOIN utterance u ON u.id = f.utterance_id"
             " JOIN text_unit t ON t.id = f.text_unit_id"
             " LEFT JOIN question q ON q.id = u.question_id"
-            " WHERE u.interview_id = ? AND a.status IN ('accepted', 'edited')"
+            " WHERE u.interview_id = ? AND a.status <> 'rejected'"
             ' ORDER BY f.utterance_id, f."start", a.id',
             (interview_db_id,),
         ).fetchall()
         return [
-            AcceptedAnnotationRow(
+            AnnotationRow(
                 id=int(row[0]),
                 code_id=int(row[1]),
                 fragment_id=int(row[2]),
@@ -257,6 +323,8 @@ class AnalyticsRepository:
                 fragment_quality=str(row[9]),
                 l2_text=str(row[10]),
                 question_identifier=None if row[11] is None else str(row[11]),
+                verified=str(row[12]) in ("accepted", "edited"),
+                interpretation_only=bool(row[13]),
             )
             for row in rows
         ]

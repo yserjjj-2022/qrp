@@ -11,10 +11,9 @@ import sqlite3
 from dataclasses import dataclass
 
 from qa.db.analytics_repo import (
-    AcceptedAnnotationRow,
     AnalyticsRepository,
+    AnnotationRow,
     CodeRow,
-    QuestionCodeRow,
     QuestionRow,
     ThemeRow,
 )
@@ -50,12 +49,13 @@ class QuoteItem:
 
 @dataclass(frozen=True)
 class ThemeCoverage:
-    """Покрытие одной темы принятыми аннотациями."""
+    """Покрытие одной темы аннотациями (все, кроме отклонённых)."""
 
     node: str
     theme: str
     status: str
     annotations: int
+    verified: int
     distinct_codes: int
     theme_codes: int
     covered_fragments: int
@@ -70,27 +70,25 @@ class NodeCoverage:
     node: str
     themes: tuple[ThemeCoverage, ...]
     annotations: int
+    verified: int
     distinct_codes: int
 
 
 @dataclass(frozen=True)
 class UnusedCode:
-    """Неиспользованные коды одной семьи с общим признаком применимости."""
+    """Неиспользованные коды одной семьи."""
 
     family: str
     names: tuple[str, ...]
-    applicable: bool
 
 
 @dataclass(frozen=True)
 class CodebookCoverage:
-    """Покрытие кодбука: использованные и неиспользованные коды."""
+    """Покрытие кодбука: использованные и неиспользованные коды по семьям."""
 
     used: int
     total: int
     unused: tuple[UnusedCode, ...]
-    unused_applicable: int
-    unused_not_applicable: int
 
 
 @dataclass(frozen=True)
@@ -104,6 +102,7 @@ class DataQuality:
     skipped_garbled: int
     failed: int
     doubtful: int
+    interpretation_only: int
     reliability: dict[int, int]
     questions_without_answer: tuple[str, ...]
     accepted_on_doubtful: int
@@ -115,6 +114,7 @@ class CoverageReport:
     """Полная модель покрытия интервью для дашборда и отчёта."""
 
     interview_code: str
+    interview_db_id: int
     group: str
     run_id: int | None
     l2_version: int | None
@@ -124,6 +124,8 @@ class CoverageReport:
     quality: DataQuality
     fragments_total: int
     covered_fragments: int
+    annotations_total: int
+    annotations_verified: int
 
 
 def theme_status(annotations: int, low_min: int, high_min: int) -> str:
@@ -150,7 +152,7 @@ def truncate_quote(text: str, limit: int) -> str:
     return cut.rstrip(" ,;:—-") + " …"
 
 
-def quote_text(annotation: AcceptedAnnotationRow, limit: int) -> str:
+def quote_text(annotation: AnnotationRow, limit: int) -> str:
     """Текст цитаты: срез L2 по позициям аннотации, иначе сохранённая цитата.
 
     Позиции относятся к тексту единицы L2, поэтому срез по ним и есть дословная
@@ -164,11 +166,11 @@ def quote_text(annotation: AcceptedAnnotationRow, limit: int) -> str:
     return truncate_quote(annotation.quote, limit)
 
 
-def cumulative_codes(annotations: list[AcceptedAnnotationRow]) -> tuple[int, ...]:
+def cumulative_codes(annotations: list[AnnotationRow]) -> tuple[int, ...]:
     """Накопление различных кодов по порядку реплик.
 
-    Шаг — одна принятая аннотация; значение — сколько различных кодов
-    встретилось до этого шага включительно.
+    Шаг — одна аннотация; значение — сколько различных кодов встретилось до
+    этого шага включительно.
     """
     seen: set[int] = set()
     points: list[int] = []
@@ -178,75 +180,44 @@ def cumulative_codes(annotations: list[AcceptedAnnotationRow]) -> tuple[int, ...
     return tuple(points)
 
 
-def _applicable_code_ids(
-    interview_group: str,
-    questions: list[QuestionRow],
-    question_codes: list[QuestionCodeRow],
-    groups: GroupsSettings,
-) -> tuple[set[int], set[int]]:
-    """Коды, применимые к группе интервью, и коды с вопросами вообще.
-
-    Код применим, если хотя бы один его вопрос адресован всем
-    (`groups.universal`) или этой группе. Код без вопросов применим: у него нет
-    ограничения по группе.
-    """
-    universal = normalize_group(groups.universal, groups)
-    target = normalize_group(interview_group, groups)
-    allowed_question_ids = {
-        question.id for question in questions if normalize_group(question.group or "", groups) in (universal, target)
-    }
-    with_questions: set[int] = {link.code_id for link in question_codes}
-    applicable: set[int] = {link.code_id for link in question_codes if link.question_id in allowed_question_ids}
-    return applicable, with_questions
-
-
 def _codebook_coverage(
     codes: list[CodeRow],
     used_code_ids: set[int],
-    applicable_code_ids: set[int],
-    codes_with_questions: set[int],
     family_order: dict[str, int],
 ) -> CodebookCoverage:
-    """Покрытие кодбука: использованные коды и неиспользованные по семьям."""
-    unused_by_key: dict[tuple[str, bool], list[str]] = {}
+    """Покрытие кодбука: использованные коды и неиспользованные по семьям.
+
+    Деления на «не применимо к группе» и «применимо, но не найдено» нет:
+    торговые вопросы фактически задавались и другим группам, а при кодировании
+    код по группе не исключался. Поэтому список один.
+    """
+    unused_by_family: dict[str, list[str]] = {}
     for code in codes:
         if code.id in used_code_ids:
             continue
-        family = code.family or "—"
-        applicable = code.id in applicable_code_ids or code.id not in codes_with_questions
-        unused_by_key.setdefault((family, applicable), []).append(code.name)
+        unused_by_family.setdefault(code.family or "—", []).append(code.name)
 
-    order = sorted(
-        unused_by_key.items(),
-        key=lambda item: (family_order.get(item[0][0], len(family_order)), item[0][0], not item[0][1]),
-    )
     unused = tuple(
-        UnusedCode(family=family, names=tuple(names), applicable=applicable) for (family, applicable), names in order
+        UnusedCode(family=family, names=tuple(names))
+        for family, names in sorted(
+            unused_by_family.items(),
+            key=lambda item: (family_order.get(item[0], len(family_order)), item[0]),
+        )
     )
-    not_applicable = sum(len(entry.names) for entry in unused if not entry.applicable)
     return CodebookCoverage(
         used=len(used_code_ids & {code.id for code in codes}),
         total=len(codes),
         unused=unused,
-        unused_applicable=sum(len(entry.names) for entry in unused if entry.applicable),
-        unused_not_applicable=not_applicable,
     )
 
 
-def _questions_without_answer(
-    questions: list[QuestionRow],
-    answered: set[int],
-    interview_group: str,
-    groups: GroupsSettings,
-) -> tuple[str, ...]:
-    """Вопросы гайда этой группы, на которые респондент не ответил."""
-    universal = normalize_group(groups.universal, groups)
-    target = normalize_group(interview_group, groups)
-    missing = [
-        question.identifier
-        for question in questions
-        if normalize_group(question.group or "", groups) in (universal, target) and question.id not in answered
-    ]
+def _questions_without_answer(questions: list[QuestionRow], answered: set[int]) -> tuple[str, ...]:
+    """Вопросы гайда, на которые респондент не ответил.
+
+    Фильтра по группе нет: считаются фактически заданные вопросы. Отсутствие
+    ответа на вопрос другой группы — такой же пропуск, как и на «своей».
+    """
+    missing = [question.identifier for question in questions if question.id not in answered]
     return tuple(sorted(missing, key=_identifier_sort_key))
 
 
@@ -268,6 +239,10 @@ def build_coverage(
 ) -> CoverageReport:
     """Собрать модель покрытия интервью.
 
+    База агрегатов — все аннотации, кроме `rejected`. Выборочный контроль не
+    фильтр: проверенные вручную (`accepted`/`edited`) выводятся отдельным
+    счётчиком «из них проверено», но не определяют покрытие.
+
     Raises:
         AggregateError: интервью нет в БД или не загружена версия кодбука.
     """
@@ -288,29 +263,30 @@ def build_coverage(
     themes = repo.themes()
     theme_codes = repo.theme_codes()
     questions = repo.questions(codebook_version_id)
-    question_codes = repo.question_codes(codebook_version_id)
-    annotations = repo.accepted_annotations(interview.id)
+    annotations = repo.annotations(interview.id)
 
     group = interview.group or ""
-    applicable_code_ids, codes_with_questions = _applicable_code_ids(group, questions, question_codes, groups)
     family_order = _family_order(themes, theme_codes, codes)
     code_names = {code.id: code.name for code in codes}
 
-    annotations_by_code: dict[int, list[AcceptedAnnotationRow]] = {}
+    annotations_by_code: dict[int, list[AnnotationRow]] = {}
     for annotation in annotations:
         annotations_by_code.setdefault(annotation.code_id, []).append(annotation)
 
     themes_by_node: dict[int, list[ThemeCoverage]] = {}
     node_names: dict[int, str] = {}
+    node_code_ids: dict[int, set[int]] = {}
     for theme in themes:
         if theme.level == 0:
             node_names[theme.id] = theme.name
             themes_by_node.setdefault(theme.id, [])
+            node_code_ids.setdefault(theme.id, set())
     for theme in themes:
         if theme.level != 1 or theme.parent_id is None:
             continue
         node_name = node_names.get(theme.parent_id, "")
         theme_code_ids = [code_id for theme_id, code_id in theme_codes if theme_id == theme.id]
+        node_code_ids.setdefault(theme.parent_id, set()).update(theme_code_ids)
         theme_annotations = [
             annotation for code_id in theme_code_ids for annotation in annotations_by_code.get(code_id, [])
         ]
@@ -321,6 +297,7 @@ def build_coverage(
                 theme=theme.name,
                 status=theme_status(len(theme_annotations), low_min, high_min),
                 annotations=len(theme_annotations),
+                verified=sum(1 for annotation in theme_annotations if annotation.verified),
                 distinct_codes=len({annotation.code_id for annotation in theme_annotations}),
                 theme_codes=len(theme_code_ids),
                 covered_fragments=len({annotation.fragment_id for annotation in theme_annotations}),
@@ -341,13 +318,20 @@ def build_coverage(
             node=name,
             themes=tuple(themes_by_node.get(node_id, [])),
             annotations=sum(theme.annotations for theme in themes_by_node.get(node_id, [])),
-            distinct_codes=sum(theme.distinct_codes for theme in themes_by_node.get(node_id, [])),
+            verified=sum(theme.verified for theme in themes_by_node.get(node_id, [])),
+            distinct_codes=len(
+                {
+                    annotation.code_id
+                    for code_id in node_code_ids.get(node_id, set())
+                    for annotation in annotations_by_code.get(code_id, [])
+                }
+            ),
         )
         for node_id, name in node_names.items()
     )
 
     used_code_ids = {annotation.code_id for annotation in annotations}
-    codebook = _codebook_coverage(codes, used_code_ids, applicable_code_ids, codes_with_questions, family_order)
+    codebook = _codebook_coverage(codes, used_code_ids, family_order)
 
     run_id = run.id if run is not None else None
     coding_counts = repo.fragment_coding_counts(interview.id, run_id) if run_id is not None else {}
@@ -368,16 +352,16 @@ def build_coverage(
         skipped_garbled=coding_counts.get("skipped_garbled", 0),
         failed=coding_counts.get("failed", 0),
         doubtful=quality_counts.get("doubtful", 0),
+        interpretation_only=sum(1 for annotation in annotations if annotation.interpretation_only),
         reliability=dict(sorted(reliability.items())),
-        questions_without_answer=_questions_without_answer(
-            questions, repo.answered_question_ids(interview.id), group, groups
-        ),
+        questions_without_answer=_questions_without_answer(questions, repo.answered_question_ids(interview.id)),
         accepted_on_doubtful=len(doubtful_annotations),
         fragments_with_accepted_doubtful=len({item.fragment_id for item in doubtful_annotations}),
     )
 
     return CoverageReport(
         interview_code=interview.code,
+        interview_db_id=interview.id,
         group=normalize_group(group, groups) if group else "",
         run_id=run_id,
         l2_version=(run.l2_version if run is not None else None) or repo.l2_version_of_fragments(interview.id),
@@ -387,6 +371,8 @@ def build_coverage(
         quality=quality,
         fragments_total=repo.fragments_total(interview.id),
         covered_fragments=len({annotation.fragment_id for annotation in annotations}),
+        annotations_total=len(annotations),
+        annotations_verified=sum(1 for annotation in annotations if annotation.verified),
     )
 
 

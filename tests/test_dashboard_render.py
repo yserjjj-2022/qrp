@@ -1,8 +1,9 @@
 """Тесты рендера дашборда (M4).
 
 Проверяется то, что видно только в готовом HTML: три плашки статусов с
-подписью «эвристика, 1 интервью», один список неиспользованных кодов с
-пометкой неприменимых и отсутствие JavaScript и внешних ресурсов.
+подписью «эвристика, 1 интервью», колонка «из них проверено», строка о доле
+ручной проверки, один список неиспользованных кодов по семьям и отсутствие
+JavaScript и внешних ресурсов.
 """
 
 from __future__ import annotations
@@ -114,13 +115,14 @@ def test_status_wording_is_neutral(tmp_path: Path, settings: Settings) -> None:
         assert word not in html
 
 
-def test_unused_codes_in_one_list_with_marks(tmp_path: Path, settings: Settings) -> None:
-    """Неиспользованные коды идут одним списком; неприменимые помечены отдельно."""
+def test_unused_codes_in_one_list_by_family(tmp_path: Path, settings: Settings) -> None:
+    """Неиспользованные коды идут одним списком по семьям, без пометки неприменимых."""
     html = render_dashboard(_report(tmp_path, settings), "2026-11-10")
-    assert "Использовано 0 из 5 кодов. Не использовано 5." in html
-    assert html.count('class="chip restricted"') == 1
-    assert 'class="chip">R1<' in html
-    assert "Пунктиром: 1 кодов не применимы" in html
+    assert "Использовано 1 из 5 кодов. Не использовано 4." in html
+    assert "restricted" not in html
+    assert "не применимо к группе" not in html
+    assert '<span class="chip">R2</span>' in html
+    assert '<span class="chip">E0</span>' in html
 
 
 def test_no_script_and_no_external_resources(tmp_path: Path, settings: Settings) -> None:
@@ -130,27 +132,32 @@ def test_no_script_and_no_external_resources(tmp_path: Path, settings: Settings)
     assert re.findall(r'(?:src|href)="([^"]+)"', html) == []
 
 
-def test_doubtful_share_rendered(tmp_path: Path, settings: Settings) -> None:
-    """Доля принятых аннотаций на doubtful выводится в блоке качества."""
-    report = _report(
-        tmp_path,
-        settings,
-        annotations=[AnnotationSpec(3, "R1", "риски")],
-    )
+def test_manual_check_share_rendered(tmp_path: Path, settings: Settings) -> None:
+    """Строка о доле ручной проверки и колонка «из них проверено» есть в HTML."""
+    report = _report(tmp_path, settings, annotations=[AnnotationSpec(3, "R1", "риски")])
     html = render_dashboard(report, "2026-11-10")
-    assert "Принятые аннотации на doubtful" in html
-    assert "1 из 1" in html
+    assert "из них проверено" in html
+    assert "Разметка модели; 1 из 6 аннотаций проверены вручную, остальные не проверялись." in html
+
+
+def test_doubtful_share_rendered(tmp_path: Path, settings: Settings) -> None:
+    """Доля аннотаций на doubtful выводится в блоке качества."""
+    report = _report(tmp_path, settings, annotations=[AnnotationSpec(3, "R1", "риски")])
+    html = render_dashboard(report, "2026-11-10")
+    assert "Аннотации на doubtful" in html
+    assert "1 из 6" in html
 
 
 def test_snapshot_and_run_in_header(tmp_path: Path, settings: Settings) -> None:
-    """Шапка подписана датой снимка и номером прогона, proposed не учтены."""
+    """Шапка подписана датой снимка и номером прогона, база агрегатов названа."""
     html = render_dashboard(_report(tmp_path, settings), "2026-11-10")
     assert "2026-11-10" in html
     assert "run 1" in html
-    assert "5 proposed не учтены" in html
+    assert "кроме отклонённых" in html
+    assert "proposed не учтены" not in html
 
 
 def test_theme_without_annotations_says_so(tmp_path: Path, settings: Settings) -> None:
-    """У темы без принятых аннотаций стоит явная строка, а не пустой блок."""
+    """У темы без аннотаций стоит явная строка, а не пустой блок."""
     html = render_dashboard(_report(tmp_path, settings), "2026-11-10")
-    assert "Цитат нет: принятых аннотаций по теме нет." in html
+    assert "Цитат нет: аннотаций по теме нет." in html

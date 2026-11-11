@@ -36,7 +36,8 @@ h1{font-size:26px;line-height:1.25;margin:0 0 6px}
 h2{font-size:18px;margin:0 0 14px}
 .sub{color:var(--muted);margin:0 0 22px}
 .banner{border:1px dashed #b9a14a;background:#fffbea;color:#6b5510;
-border-radius:8px;padding:10px 14px;margin:0 0 26px;font-size:14px}
+border-radius:8px;padding:10px 14px;margin:0 0 10px;font-size:14px}
+.meta-line{color:var(--muted);font-size:13px;margin:0 0 22px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
 padding:20px 20px 18px;margin:0 0 22px}
 .meta{display:flex;flex-wrap:wrap;gap:8px 28px;color:var(--muted);font-size:13px;margin:0 0 18px}
@@ -57,6 +58,7 @@ font-weight:600;white-space:nowrap}
 .pill.has{background:var(--has);color:var(--has-ink)}
 .heur{color:var(--muted);font-size:11px;display:block;margin-top:2px}
 .heur-inline{color:var(--muted);font-size:11px}
+.verified{color:var(--muted);font-variant-numeric:tabular-nums}
 .codes{font-variant-numeric:tabular-nums}
 .codes .of{color:var(--muted)}
 .bar{display:inline-block;height:6px;border-radius:3px;background:var(--accent);
@@ -76,8 +78,8 @@ border-bottom:1px solid #eef1f5;font-size:14px}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chip{font-size:12px;padding:2px 8px;border-radius:6px;background:#f2f4f8;
 color:#333c4c;font-variant-numeric:tabular-nums}
-.chip.restricted{background:#f6f7f9;color:#8b94a3;border:1px dashed #c9cfd9}
 .note{color:var(--muted);font-size:13px;margin:10px 0 0}
+.family{color:var(--muted);font-size:12px;font-weight:600;margin:12px 0 4px}
 .kpi{display:flex;flex-wrap:wrap;gap:26px;margin:0 0 4px}
 .kpi div{min-width:130px}
 .kpi .k{font-size:24px;font-weight:650}
@@ -140,6 +142,7 @@ def _theme_rows(theme: ThemeCoverage, fragments_total: int) -> str:
         f'<td><span class="pill {pill}">{escape(label)}</span>'
         f'<span class="heur">{escape(HEURISTIC_CAPTION)}</span></td>'
         f'<td class="num">{theme.annotations}</td>'
+        f'<td class="num verified">{theme.verified}</td>'
         f'<td class="codes num">{theme.distinct_codes} <span class="of">/ {theme.theme_codes}</span></td>'
         f"<td>{covered}{theme.covered_fragments} ({_pct(theme.covered_fragments, fragments_total)})</td>"
         f"<td>{_spark(theme.cumulative)}</td>"
@@ -155,53 +158,50 @@ def _theme_rows(theme: ThemeCoverage, fragments_total: int) -> str:
         )
         detail = f"<details><summary>цитаты ({len(theme.quotes)})</summary>{quotes}</details>"
     elif theme.theme_codes == 0:
-        detail = '<p class="note" style="margin:2px 0 12px 30px">Тема без кодов: привязка к кодубуку пуста.</p>'
+        detail = '<p class="note" style="margin:2px 0 12px 30px">Тема без кодов: привязка к кодбуку пуста.</p>'
     else:
-        detail = '<p class="note" style="margin:2px 0 12px 30px">Цитат нет: принятых аннотаций по теме нет.</p>'
-    return row + f'<tr><td colspan="6" style="padding:0;border:0">{detail}</td></tr>'
+        detail = '<p class="note" style="margin:2px 0 12px 30px">Цитат нет: аннотаций по теме нет.</p>'
+    return row + f'<tr><td colspan="7" style="padding:0;border:0">{detail}</td></tr>'
 
 
 def _codebook_block(codebook: CodebookCoverage) -> str:
-    """Блок покрытия кодбука: один список с пометкой неприменимых кодов."""
-    chips = "".join(
-        f'<span class="chip{" restricted" if not entry.applicable else ""}">{escape(name)}</span>'
-        for entry in codebook.unused
-        for name in entry.names
-    )
+    """Блок покрытия кодбука: один список неиспользованных кодов по семьям."""
     unused_total = sum(len(entry.names) for entry in codebook.unused)
-    if not chips:
-        chips = '<p class="note" style="margin:0">Все коды кодбука использованы.</p>'
+    groups = "".join(
+        f'<p class="family">{escape(entry.family)}</p>'
+        f'<div class="chips">' + "".join(f'<span class="chip">{escape(name)}</span>' for name in entry.names) + "</div>"
+        for entry in codebook.unused
+    )
+    if not groups:
+        groups = '<p class="note" style="margin:0">Все коды кодбука использованы.</p>'
     return (
         '<div class="card"><h2>2. Покрытие кодбука</h2>'
         f'<p style="margin:0 0 4px"><b>Использовано {codebook.used} из {codebook.total} кодов.'
         f" Не использовано {unused_total}.</b> "
         f'<span class="heur-inline">{escape(HEURISTIC_CAPTION)}</span></p>'
-        '<p class="note" style="margin-top:0">Один список без разделения по группам: пунктиром '
-        "отмечены коды, чьи вопросы задаются только другой группе, — их отсутствие в этом "
-        "интервью не дефект. Остальные могли встретиться, но принятых аннотаций нет.</p>"
-        f'<div class="chips">{chips}</div>'
-        f'<p class="note">Пунктиром: {codebook.unused_not_applicable} кодов не применимы к группе. '
-        f"Сплошным: {codebook.unused_applicable} кодов применимы, но не найдены.</p>"
+        '<p class="note" style="margin-top:0">Один список по семьям, без деления по группам '
+        "интервью: код считается неиспользованным, если по нему нет ни одной аннотации.</p>"
+        f"{groups}"
         "</div>"
     )
 
 
-def _quality_block(quality: DataQuality) -> str:
+def _quality_block(quality: DataQuality, total: int, verified: int) -> str:
     """Блок качества данных: статусы, надёжность, doubtful, вопросы без ответа."""
     status = quality.by_status
     left: list[tuple[str, str]] = [
         ("Аннотации: accepted", str(status.get("accepted", 0))),
         ("Аннотации: edited", str(status.get("edited", 0))),
-        ("Аннотации: proposed (не учтены)", str(status.get("proposed", 0))),
+        ("Аннотации: proposed", str(status.get("proposed", 0))),
         ("Фрагменты: coded", str(quality.coded)),
         ("Фрагменты: unmarked", str(quality.unmarked)),
         ("Фрагменты: skipped_garbled", str(quality.skipped_garbled)),
         ("Фрагменты: doubtful", str(quality.doubtful)),
         ("Аннотации с кодом OTH", str(quality.oth)),
     ]
-    accepted = status.get("accepted", 0) + status.get("edited", 0)
     right: list[tuple[str, str]] = [(f"Надёжность {level}", str(count)) for level, count in quality.reliability.items()]
-    right.append(("Принятые аннотации на doubtful", f"{quality.accepted_on_doubtful} из {accepted}"))
+    right.append(("Проверено вручную", f"{verified} из {total}"))
+    right.append(("Аннотации на doubtful", f"{quality.accepted_on_doubtful} из {total}"))
     right.append(
         ("doubtful-фрагменты с аннотацией", f"{quality.fragments_with_accepted_doubtful} из {quality.doubtful}")
     )
@@ -244,23 +244,27 @@ def render_dashboard(report: CoverageReport, snapshot_date: str) -> str:
     ]
     meta_html = "".join(f"<span>{escape(name)}: <b>{escape(value)}</b></span>" for name, value in meta)
 
-    accepted = report.quality.by_status.get("accepted", 0) + report.quality.by_status.get("edited", 0)
+    total = report.annotations_total
+    verified = report.annotations_verified
     kpi = (
-        f'<div><div class="k">{accepted}</div><div class="l">принятых аннотаций</div></div>'
+        f'<div><div class="k">{total}</div><div class="l">аннотаций, кроме отклонённых</div></div>'
+        f'<div><div class="k">{verified}</div><div class="l">из них проверено вручную</div></div>'
         f'<div><div class="k">{report.covered_fragments} / {report.fragments_total}</div>'
         '<div class="l">фрагментов с аннотацией</div></div>'
         f'<div><div class="k">{report.codebook.used} / {report.codebook.total}</div>'
         '<div class="l">кодов кодбука</div></div>'
-        f'<div><div class="k">{report.quality.by_status.get("proposed", 0)}</div>'
-        '<div class="l">proposed, не учтены</div></div>'
     )
 
     rows: list[str] = []
     for node in report.nodes:
-        rows.append(f'<tr class="node"><td>{escape(node.node)}</td><td colspan="5"></td></tr>')
+        rows.append(
+            f'<tr class="node"><td>{escape(node.node)}</td><td></td>'
+            f'<td class="num">{node.annotations}</td><td class="num verified">{node.verified}</td>'
+            f'<td class="codes num">{node.distinct_codes}</td><td colspan="2"></td></tr>'
+        )
         if not node.themes:
             rows.append(
-                '<tr><td colspan="6" style="padding:0;border:0">'
+                '<tr><td colspan="7" style="padding:0;border:0">'
                 '<p class="note" style="margin:2px 0 12px 30px">Узел без тем.</p></td></tr>'
             )
         for theme in node.themes:
@@ -268,8 +272,10 @@ def render_dashboard(report: CoverageReport, snapshot_date: str) -> str:
 
     tree = (
         '<div class="card"><h2>1. Дерево тем</h2><table><thead><tr>'
-        '<th style="width:34%">Узел / тема</th><th style="width:20%">Статус</th>'
-        '<th class="num" style="width:9%">Аннотаций</th><th class="num" style="width:11%">Кодов</th>'
+        '<th style="width:28%">Узел / тема</th><th style="width:16%">Статус</th>'
+        '<th class="num" style="width:9%">Аннотаций</th>'
+        '<th class="num" style="width:11%">из них проверено</th>'
+        '<th class="num" style="width:10%">Кодов</th>'
         '<th style="width:16%">Покрытие фрагментов</th><th style="width:10%">Кривая</th>'
         "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
         '<p class="note">Статусы листьев — эвристика на одном интервью. Шкала 0 / 1–3 / 4 и больше '
@@ -284,11 +290,12 @@ def render_dashboard(report: CoverageReport, snapshot_date: str) -> str:
         "<h1>Дашборд покрытия дерева тем</h1>\n"
         '<p class="sub">Один вопрос: где нет данных по темам кодбука.</p>\n'
         f'<div class="banner">Снимок чисел на {escape(snapshot_date)}, '
-        f"run {escape(str(report.run_id))}. В агрегаты входят только accepted и edited: "
-        f"{report.quality.by_status.get('proposed', 0)} proposed не учтены.</div>\n"
+        f"run {escape(str(report.run_id))}. В агрегаты входят все аннотации, кроме отклонённых.</div>\n"
+        f'<p class="meta-line">Разметка модели; {verified} из {total} аннотаций проверены вручную, '
+        "остальные не проверялись.</p>\n"
         f'<div class="card"><div class="meta">{meta_html}</div><div class="kpi">{kpi}</div></div>\n'
         f"{tree}\n{_codebook_block(report.codebook)}\n"
-        f"{_quality_block(report.quality)}\n"
+        f"{_quality_block(report.quality, total, verified)}\n"
         '<div class="card"><h2>4. Цитаты</h2><p class="note" style="margin:0">'
         "Цитаты раскрываются внутри блока 1, под строкой темы: так цитата остаётся рядом со "
         "счётчиками своей темы.</p></div>\n"
