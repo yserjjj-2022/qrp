@@ -531,6 +531,48 @@ def _settings_error_summary(exc: Exception) -> str:
     return "некорректные настройки"
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Собрать HTML-дашборд покрытия дерева тем (M4)."""
+    from datetime import date
+
+    from qa.dashboard.render import render_dashboard
+    from qa.pipeline.aggregate import AggregateError, build_coverage
+
+    settings = _load_settings()
+    run_id = setup_logging(settings.log_level)
+    conn = _open_db(settings)
+    try:
+        report = build_coverage(
+            conn,
+            args.interview,
+            settings.groups,
+            low_min=settings.m4.theme_low_min_annotations,
+            high_min=settings.m4.theme_high_min_annotations,
+            quotes_per_theme=settings.m4.quotes_per_theme,
+            quote_max_chars=settings.m4.quote_max_chars,
+        )
+    except AggregateError as exc:
+        print(f"[{run_id}] dashboard: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    snapshot = args.snapshot_date or date.today().isoformat()
+    html = render_dashboard(report, snapshot)
+    default_name = f"dashboard_{report.interview_code}.html"
+    output = Path(args.output) if args.output else Path(settings.paths.exports) / default_name
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(html, encoding="utf-8")
+
+    accepted = report.quality.by_status.get("accepted", 0) + report.quality.by_status.get("edited", 0)
+    print(
+        f"[{run_id}] dashboard {report.interview_code}: тем={sum(len(node.themes) for node in report.nodes)}, "
+        f"принятых аннотаций={accepted}, кодов={report.codebook.used} из {report.codebook.total}, "
+        f"run={report.run_id if report.run_id is not None else '—'} -> {output}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Собрать парсер команд."""
     parser = argparse.ArgumentParser(
@@ -604,6 +646,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_coding_review.add_argument("file", help="Заполненный xlsx очереди ручной проверки кодирования")
     p_coding_review.set_defaults(func=cmd_import_coding_review)
+
+    p_dash = subparsers.add_parser("dashboard", help="HTML-дашборд покрытия дерева тем (M4)")
+    p_dash.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_dash.add_argument("--output", help="Путь к HTML; по умолчанию data/exports/dashboard_<код>.html")
+    p_dash.add_argument("--snapshot-date", help="Дата снимка чисел (ISO); по умолчанию сегодня")
+    p_dash.set_defaults(func=cmd_dashboard)
 
     return parser
 

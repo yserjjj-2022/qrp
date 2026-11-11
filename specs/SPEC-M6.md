@@ -163,20 +163,22 @@ m3:
 @dataclass(frozen=True)
 class QuoteItem:
     code_name: str
-    text: str          # дословный срез L2 или вырезка с многоточием
+    text: str  # дословный срез L2 или вырезка с многоточием
     question_identifier: str | None
+
 
 @dataclass(frozen=True)
 class ThemeCoverage:
     node: str
     theme: str
-    status: str                     # "no_data" | "few" | "has_data"
-    annotations: int                # принятые аннотации на коды темы
-    distinct_codes: int             # различных кодов темы с аннотациями
-    theme_codes: int                # кодов привязано к теме
-    covered_fragments: int          # различных фрагментов с принятой аннотацией
-    cumulative: tuple[int, ...]     # накопление различных кодов по порядку реплик
+    status: str  # "no_data" | "few" | "has_data"
+    annotations: int  # принятые аннотации на коды темы
+    distinct_codes: int  # различных кодов темы с аннотациями
+    theme_codes: int  # кодов привязано к теме
+    covered_fragments: int  # различных фрагментов с принятой аннотацией
+    cumulative: tuple[int, ...]  # накопление различных кодов по порядку реплик
     quotes: tuple[QuoteItem, ...]
+
 
 @dataclass(frozen=True)
 class NodeCoverage:
@@ -185,32 +187,36 @@ class NodeCoverage:
     annotations: int
     distinct_codes: int
 
+
 @dataclass(frozen=True)
 class UnusedCode:
     family: str
     names: tuple[str, ...]
-    applicable: bool     # True = «применимо, но не найдено»; False = «не применимо к группе»
+    applicable: bool  # True = «применимо, но не найдено»; False = «не применимо к группе»
+
 
 @dataclass(frozen=True)
 class CodebookCoverage:
     used: int
     total: int
     unused: tuple[UnusedCode, ...]
-    unused_applicable: int       # 18 на снимке
-    unused_not_applicable: int   # 8 на снимке
+    unused_applicable: int  # 18 на снимке
+    unused_not_applicable: int  # 8 на снимке
+
 
 @dataclass(frozen=True)
 class DataQuality:
-    by_status: dict[str, int]       # proposed / accepted / edited
+    by_status: dict[str, int]  # proposed / accepted / edited
     unmarked: int
     oth: int
     skipped_garbled: int
     failed: int
     doubtful: int
-    reliability: dict[int, int]     # 1..3 -> число принятых аннотаций
+    reliability: dict[int, int]  # 1..3 -> число принятых аннотаций
     questions_without_answer: tuple[str, ...]
-    accepted_on_doubtful: int       # принятых аннотаций на doubtful-фрагментах (39)
+    accepted_on_doubtful: int  # принятых аннотаций на doubtful-фрагментах (39)
     fragments_with_accepted_doubtful: int  # doubtful-фрагментов с принятой аннотацией (33)
+
 
 @dataclass(frozen=True)
 class CoverageReport:
@@ -239,21 +245,24 @@ class RunInfo:
     # стадия восстанавливается (кодирование — ключ `fragments`, структура —
     # `blocks`). Поле выводится из `params_json`, а не читается из колонки.
 
+
 @dataclass(frozen=True)
 class Provenance:
     interview_code: str
     group: str
-    transcript_type: str      # «машинная расшифровка с лёгкой редакцией»
+    transcript_type: str  # «машинная расшифровка с лёгкой редакцией»
     l2_version: int
     codebook_version_id: int | None
-    snapshot_date: str        # дата снимка чисел, ISO
+    snapshot_date: str  # дата снимка чисел, ISO
     snapshot_run_id: int | None  # прогон, по которому считались числа
     runs: tuple[RunInfo, ...]
 
+
 @dataclass(frozen=True)
 class Limitation:
-    code: str        # машинный ключ
-    text: str        # формулировка для читателя
+    code: str  # машинный ключ
+    text: str  # формулировка для читателя
+
 
 @dataclass(frozen=True)
 class InterviewReport:

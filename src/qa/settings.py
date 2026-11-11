@@ -139,6 +139,34 @@ class M2Settings(BaseModel):
     review_sample_share: float = Field(default=0.10, ge=0, le=1)
 
 
+class M4Settings(BaseModel):
+    """Настройки агрегации покрытия и дашборда (M4).
+
+    Границы статуса листа — грубая шкала «есть чем показать тему или нет», а не
+    измерение раскрытия: `0` даёт «нет данных», `1..3` — «мало», `4` и больше —
+    «есть данные». Порог не подбирается под красивую градацию.
+    """
+
+    theme_low_min_annotations: int = Field(default=1, ge=0)
+    theme_high_min_annotations: int = Field(default=4, ge=1)
+    quotes_per_theme: int = Field(default=2, ge=0)
+    quote_max_chars: int = Field(default=240, ge=20)
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> M4Settings:
+        """Верхняя граница статуса должна быть выше нижней."""
+        if self.theme_high_min_annotations <= self.theme_low_min_annotations:
+            raise ValueError("m4: theme_high_min_annotations должен быть больше theme_low_min_annotations")
+        return self
+
+
+class M3Settings(BaseModel):
+    """Настройки лексических векторов и кластеризации `OTH` (M3)."""
+
+    oth_cluster_threshold: float = Field(default=0.35, gt=0, le=1)
+    similar_top_k: int = Field(default=10, ge=1)
+
+
 class GroupsSettings(BaseModel):
     """Канонические значения групп и их алиасы.
 
@@ -224,6 +252,7 @@ class PathsSettings(BaseModel):
     backups: str = "data/backups"
     cache: str = "data/cache"
     exports: str = "data/exports"
+    reports: str = "data/reports"
     golden: str = "data/golden"
 
 
@@ -290,7 +319,9 @@ class Settings(BaseModel):
     pipeline: PipelineSettings = PipelineSettings()
     m1b: M1bSettings = M1bSettings()
     m1c: M1cSettings = M1cSettings()
-    m2: M2Settings = M2Settings()
+    m2: M2Settings = Field(default_factory=M2Settings)
+    m3: M3Settings = Field(default_factory=M3Settings)
+    m4: M4Settings = Field(default_factory=M4Settings)
     workbook: WorkbookSettings = WorkbookSettings()
     groups: GroupsSettings = GroupsSettings()
     lexicon_status_map: dict[str, str] = Field(default_factory=dict)
@@ -380,6 +411,7 @@ class Settings(BaseModel):
             self.paths.backups,
             self.paths.cache,
             self.paths.exports,
+            self.paths.reports,
             self.paths.golden,
             str(Path(self.db_path).parent),
         ):

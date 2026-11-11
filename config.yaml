@@ -10,6 +10,7 @@ paths:
   backups: data/backups
   cache: data/cache
   exports: data/exports
+  reports: data/reports
   golden: data/golden
 
 db_path: data/db/interviews.db
@@ -55,6 +56,22 @@ m2:
   # Выборочная доля очереди ручной проверки. OTH, ненадёжные, doubtful с
   # интерпретацией и фрагменты с pii_flag проверяются целиком, вне выборки.
   review_sample_share: 0.10
+
+# Агрегация покрытия и дашборд (M4).
+m4:
+  # Границы статуса листа. Порог не подбирается под красивую градацию:
+  # 0 / 1-3 / 4+ — грубая шкала «есть чем показать или нет».
+  # Эвристика на одном интервью, уточняется на корпусе.
+  theme_low_min_annotations: 1      # 0 -> "нет данных"
+  theme_high_min_annotations: 4     # 1..3 -> "мало"; >= 4 -> "есть данные"
+  quotes_per_theme: 2
+  quote_max_chars: 240
+
+# Лексические векторы и кластеризация OTH (M3).
+m3:
+  # Порог косинусного сходства для кластера OTH (лексический TF-IDF).
+  oth_cluster_threshold: 0.35
+  similar_top_k: 10
 
 # Строка предметной области для промпта нормализации задаётся вне репозитория:
 # переменной окружения QA_DOMAIN_HINT или файлом config.local.yaml (в .gitignore).
