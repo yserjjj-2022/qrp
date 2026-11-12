@@ -16,10 +16,28 @@ from qa.settings import Settings, load_env_file
 _SUSPECTS_PREVIEW = 20
 
 
-def _load_settings() -> Settings:
-    """Загрузить .env (если есть) и настройки проекта."""
+def _load_settings(db_path: str | None = None) -> Settings:
+    """Загрузить .env (если есть) и настройки проекта.
+
+    `db_path` — явный путь к БД из опции `--db`: он приоритетнее `QA_DB_PATH`
+    и `paths.db` (см. `Settings.load`).
+    """
     load_env_file()
-    return Settings.load()
+    return Settings.load(db_path=db_path)
+
+
+def _db_from_args(args: argparse.Namespace) -> str | None:
+    """Путь к БД из опции `--db`, если она задана."""
+    value = getattr(args, "db", None)
+    return str(value) if value else None
+
+
+def _add_db_option(parser: argparse.ArgumentParser) -> None:
+    """Добавить подкоманде общую опцию выбора файла БД."""
+    parser.add_argument(
+        "--db",
+        help="Путь к файлу БД; приоритетнее QA_DB_PATH и paths.db",
+    )
 
 
 def _migrations_dir() -> Path:
@@ -64,7 +82,7 @@ def _print_notes(notes: list[str]) -> None:
 
 def cmd_load_codebook(args: argparse.Namespace) -> int:
     """Загрузить обязательные листы книги, темы и словарь замен."""
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.load_codebook import load_codebook
 
@@ -94,7 +112,7 @@ def cmd_load_codebook(args: argparse.Namespace) -> int:
 
 def cmd_load_project(args: argparse.Namespace) -> int:
     """Загрузить необязательные листы проекта и умолчания."""
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.load_project import load_project
 
@@ -120,7 +138,7 @@ def cmd_load_project(args: argparse.Namespace) -> int:
 
 def cmd_init_interview(args: argparse.Namespace) -> int:
     """Определить говорящих, показать роли, подтвердить и записать интервью."""
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.init_interview import apply_plan, build_plan, create_names_map_skeleton, render_plan
 
@@ -147,7 +165,7 @@ def cmd_init_interview(args: argparse.Namespace) -> int:
 
 def cmd_load_transcript(args: argparse.Namespace) -> int:
     """Загрузить транскрипт интервью (M1a)."""
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.init_interview import build_plan, plan_to_meta, resolve_names_map
     from qa.pipeline.load_transcript import build_replacement_map, load_meta, load_transcript
@@ -184,7 +202,7 @@ def cmd_load_transcript(args: argparse.Namespace) -> int:
 
 def cmd_review_terms(args: argparse.Namespace) -> int:
     """Интерактивно утвердить или отклонить кандидатов new_term."""
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.review_terms import review_terms
 
@@ -205,7 +223,7 @@ def cmd_review_terms(args: argparse.Namespace) -> int:
 
 def cmd_export_golden_sample(args: argparse.Namespace) -> int:
     """Выгрузить реплики L1 в xlsx для ручной нормализации."""
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.golden import GOLDEN_FILENAME, export_golden_sample
 
@@ -221,7 +239,7 @@ def cmd_export_golden_sample(args: argparse.Namespace) -> int:
 
 def cmd_import_golden(args: argparse.Namespace) -> int:
     """Загрузить заполненный золотой набор (файл или лист книги)."""
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.golden import GOLDEN_FILENAME, import_golden
 
@@ -243,7 +261,7 @@ def cmd_llm_ping(args: argparse.Namespace) -> int:
     from qa.llm.ping import dry_run_llm, ping_llm
 
     try:
-        settings = _load_settings()
+        settings = _load_settings(_db_from_args(args))
     except ValidationError as exc:
         print(f"llm-ping: ошибка настроек — {_settings_error_summary(exc)}")
         return 1
@@ -286,7 +304,7 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     )
     from qa.version import code_version
 
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     conn = _open_db(settings)
     try:
@@ -408,7 +426,7 @@ def cmd_structure(args: argparse.Namespace) -> int:
     from qa.pipeline.structure import StructureError, format_report, structure_interview
     from qa.version import code_version
 
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
 
     provider = None
@@ -454,7 +472,7 @@ def cmd_code(args: argparse.Namespace) -> int:
     from qa.pipeline.coding import CodingError, code_interview, format_report, plan_dry_run
     from qa.version import code_version
 
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     conn = _open_db(settings)
     try:
@@ -527,7 +545,7 @@ def _export_coding_review(settings: Settings, result: object, run_id: str) -> No
 
 def cmd_import_coding_review(args: argparse.Namespace) -> int:
     """Записать решения ручной проверки кодирования и посчитать метрику."""
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     from qa.pipeline.coding_review import import_coding_review
 
@@ -565,7 +583,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     from qa.dashboard.render import render_dashboard
     from qa.pipeline.aggregate import AggregateError, build_coverage
 
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     conn = _open_db(settings)
     try:
@@ -610,7 +628,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     from qa.report.model import build_report
     from qa.report.render import render_report
 
-    settings = _load_settings()
+    settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
     conn = _open_db(settings)
     try:
@@ -656,15 +674,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_load = subparsers.add_parser("load-codebook", help="Загрузить кодбук, темы и словарь замен")
     p_load.add_argument("workbook", nargs="?", help="Путь к книге (.xlsx); по умолчанию paths.workbook")
     p_load.add_argument("--reload", action="store_true", help="Пересобрать темы, даже если книга уже загружена")
+    _add_db_option(p_load)
     p_load.set_defaults(func=cmd_load_codebook)
 
     p_project = subparsers.add_parser("load-project", help="Загрузить необязательные листы проекта")
     p_project.add_argument("workbook", nargs="?", help="Путь к книге (.xlsx); по умолчанию paths.workbook")
+    _add_db_option(p_project)
     p_project.set_defaults(func=cmd_load_project)
 
     p_init = subparsers.add_parser("init-interview", help="Определить роли и записать интервью")
     p_init.add_argument("transcript", help="Путь к транскрипту (.txt, UTF-8), имя файла = код респондента")
     p_init.add_argument("--group", help="Группа респондента; значения и алиасы заданы в config.yaml (groups)")
+    _add_db_option(p_init)
     p_init.set_defaults(func=cmd_init_interview)
 
     p_tr = subparsers.add_parser("load-transcript", help="Загрузить транскрипт интервью (M1a)")
@@ -672,19 +693,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--interview-id", help="id_интервью из БД или листа «Интервью»")
     p_tr.add_argument("--group", help="Группа респондента, если интервью ещё нет в БД (значения из config.yaml)")
     p_tr.add_argument("--meta", help="Устаревший interview.yaml (совместимость)")
+    _add_db_option(p_tr)
     p_tr.set_defaults(func=cmd_load_transcript)
 
     p_review = subparsers.add_parser("review-terms", help="Ревью кандидатов новых терминов (M1b)")
+    _add_db_option(p_review)
     p_review.set_defaults(func=cmd_review_terms)
 
     p_export = subparsers.add_parser("export-golden-sample", help="Выгрузить реплики L1 для золотого набора")
     p_export.add_argument("--n", type=int, default=40, help="Сколько реплик выбрать (default: 40)")
     p_export.add_argument("--interview-id", help="Только это интервью")
     p_export.add_argument("--output", help="Путь к xlsx; по умолчанию data/golden/golden_sample.xlsx")
+    _add_db_option(p_export)
     p_export.set_defaults(func=cmd_export_golden_sample)
 
     p_import = subparsers.add_parser("import-golden", help="Загрузить заполненный золотой набор")
     p_import.add_argument("file", nargs="?", help="Путь к xlsx; по умолчанию data/golden/golden_sample.xlsx")
+    _add_db_option(p_import)
     p_import.set_defaults(func=cmd_import_golden)
 
     p_ping = subparsers.add_parser("llm-ping", help="Проверить LLM-эндпоинт на синтетическом запросе")
@@ -702,6 +727,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Собрать подозрительные слова без модели и записать кандидатов в new_term",
     )
     p_norm.add_argument("--review-export", action="store_true", help="Выгрузить файл ручной проверки L2")
+    _add_db_option(p_norm)
     p_norm.set_defaults(func=cmd_normalize)
 
     p_struct = subparsers.add_parser("structure", help="Привязать реплики к вопросам гайда и разбить L2 (M1c)")
@@ -709,12 +735,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_struct.add_argument("--l2-version", type=int, help="Версия L2; по умолчанию последняя записанная")
     p_struct.add_argument("--rebuild", action="store_true", help="Пересобрать привязку и фрагменты")
     p_struct.add_argument("--no-model", action="store_true", help="Без вызовов модели: только правила кода")
+    _add_db_option(p_struct)
     p_struct.set_defaults(func=cmd_structure)
 
     p_code = subparsers.add_parser("code", help="Закодировать фрагменты интервью кодами кодбука (M2)")
     p_code.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
     p_code.add_argument("--dry-run", action="store_true", help="Посчитать объём работы без вызовов модели")
     p_code.add_argument("--review-export", action="store_true", help="Выгрузить очередь ручной проверки")
+    _add_db_option(p_code)
     p_code.set_defaults(func=cmd_code)
 
     p_coding_review = subparsers.add_parser(
@@ -722,18 +750,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Записать решения ручной проверки кодирования и посчитать долю принятых без правок",
     )
     p_coding_review.add_argument("file", help="Заполненный xlsx очереди ручной проверки кодирования")
+    _add_db_option(p_coding_review)
     p_coding_review.set_defaults(func=cmd_import_coding_review)
 
     p_dash = subparsers.add_parser("dashboard", help="HTML-дашборд покрытия дерева тем (M4)")
     p_dash.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
     p_dash.add_argument("--output", help="Путь к HTML; по умолчанию data/exports/dashboard_<код>.html")
     p_dash.add_argument("--snapshot-date", help="Дата снимка чисел (ISO); по умолчанию сегодня")
+    _add_db_option(p_dash)
     p_dash.set_defaults(func=cmd_dashboard)
 
     p_report = subparsers.add_parser("report", help="HTML-отчёт по интервью (M5)")
     p_report.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
     p_report.add_argument("--output", help="Путь к HTML; по умолчанию data/reports/report_<код>.html")
     p_report.add_argument("--snapshot-date", help="Дата снимка чисел (ISO); по умолчанию сегодня")
+    _add_db_option(p_report)
     p_report.set_defaults(func=cmd_report)
 
     return parser

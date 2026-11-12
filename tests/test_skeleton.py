@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,79 @@ class TestDomainHint:
         config = tmp_path / "config.yaml"
         config.write_text("log_level: INFO\n", encoding="utf-8")
         assert Settings.load(config).domain_hint == ""
+
+
+class TestDbPathOverride:
+    """Путь к БД задаётся опцией --db или переменной QA_DB_PATH."""
+
+    def test_argument_overrides_config(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.yaml"
+        config.write_text("paths:\n  db: data/db/interviews.db\n", encoding="utf-8")
+        loaded = Settings.load(config, db_path=str(tmp_path / "copy.db"))
+        assert loaded.db_path == str(tmp_path / "copy.db")
+
+    def test_env_overrides_config(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.yaml"
+        config.write_text("paths:\n  db: data/db/interviews.db\n", encoding="utf-8")
+        with patch.dict(os.environ, {"QA_DB_PATH": str(tmp_path / "copy.db")}, clear=False):
+            assert Settings.load(config).db_path == str(tmp_path / "copy.db")
+
+    def test_argument_beats_env(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.yaml"
+        config.write_text("paths:\n  db: data/db/interviews.db\n", encoding="utf-8")
+        with patch.dict(os.environ, {"QA_DB_PATH": str(tmp_path / "env.db")}, clear=False):
+            loaded = Settings.load(config, db_path=str(tmp_path / "cli.db"))
+        assert loaded.db_path == str(tmp_path / "cli.db")
+
+    def test_empty_env_keeps_config(self, config_path: Path) -> None:
+        """Пустая переменная не затирает путь из конфига."""
+        with patch.dict(os.environ, {"QA_DB_PATH": "   "}, clear=False):
+            loaded = Settings.load(config_path)
+        assert loaded.db_path == Settings.load(config_path).paths.db
+
+    def test_db_override_creates_copy_not_working_db(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Команда с --db создаёт копию и не создаёт рабочую БД.
+
+        `review-terms` выбран как команда без модели: на пустой базе очередь
+        пуста, ввода с stdin нет. Рабочая база в тесте — путь, которого нет:
+        если бы опция игнорировалась, файл появился бы.
+        """
+        work_db = tmp_path / "work.db"
+        copy_db = tmp_path / "copy.db"
+        (tmp_path / "config.yaml").write_text(
+            f"paths:\n  data: {tmp_path / 'data'}\n  db: {work_db}\n"
+            f"  backups: {tmp_path / 'backups'}\n  cache: {tmp_path / 'cache'}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        with patch.object(sys, "argv", ["qa-pipeline", "review-terms", "--db", str(copy_db)]):
+            assert main() == 0
+
+        assert copy_db.exists()
+        assert not work_db.exists()
+        check = sqlite3.connect(copy_db)
+        try:
+            assert check.execute("SELECT COUNT(*) FROM applied_migrations").fetchone()[0] > 0
+            assert check.execute("SELECT COUNT(*) FROM new_term").fetchone()[0] == 0
+        finally:
+            check.close()
+
+    def test_env_path_is_used_by_command(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """QA_DB_PATH без --db направляет команду в указанную базу."""
+        work_db = tmp_path / "work.db"
+        copy_db = tmp_path / "copy.db"
+        (tmp_path / "config.yaml").write_text(
+            f"paths:\n  data: {tmp_path / 'data'}\n  db: {work_db}\n"
+            f"  backups: {tmp_path / 'backups'}\n  cache: {tmp_path / 'cache'}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("QA_DB_PATH", str(copy_db))
+        with patch.object(sys, "argv", ["qa-pipeline", "review-terms"]):
+            assert main() == 0
+
+        assert copy_db.exists()
+        assert not work_db.exists()
 
 
 class TestLogging:

@@ -423,13 +423,18 @@ class Settings(BaseModel):
             Path(value).mkdir(parents=True, exist_ok=True)
 
     @classmethod
-    def load(cls, config_path: Path | None = None) -> Settings:
+    def load(cls, config_path: Path | None = None, db_path: str | None = None) -> Settings:
         """Загрузить настройки из config.yaml + локального config.local.yaml + окружения.
 
         `config.local.yaml` не коммитится: в нём лежат значения, которых не
         должно быть в публичном репозитории (`domain_hint` с названиями
         брокеров и продуктов). Значения из локального файла перекрывают
         `config.yaml` поверхностно, по верхним ключам.
+
+        Путь к БД задаётся в порядке приоритета: аргумент `db_path` (опция
+        `--db`), затем `QA_DB_PATH`, затем `paths.db` из конфига. Без явного
+        пути команда молча работала бы по рабочей базе — так произошёл инцидент
+        2026-11-12 с записью 140 строк в `new_term`.
 
         `.env` читается вызывающей стороной (`load_env_file`) на входе CLI:
         библиотечный код не меняет окружение процесса неявно.
@@ -440,7 +445,11 @@ class Settings(BaseModel):
         # Локальный файл рядом с конфигом: значения, которых не должно быть в
         # публичном репозитории. Отсутствие файла — норма, не ошибка.
         data.update(_read_yaml(config_path.with_name("config.local.yaml")))
-        return cls(**data)
+        settings = cls(**data)
+        explicit = (db_path or "").strip() or (os.environ.get("QA_DB_PATH") or "").strip()
+        if explicit:
+            settings.paths.db = explicit
+        return settings
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

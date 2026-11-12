@@ -1536,7 +1536,7 @@ class TestSuspectsOnlyCli:
 
         from qa import cli
 
-        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr(cli, "_load_settings", lambda _db_path=None: settings)
         monkeypatch.setattr(cli, "_open_db", lambda _settings: db)
         args = argparse.Namespace(interview="R01", suspects_only=True, dry_run=False, new_version=False)
         assert cli.cmd_normalize(args) == 0
