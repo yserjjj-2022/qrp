@@ -670,6 +670,23 @@ class InterviewRepository:
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
+    def coding_refs_on_utterances(self, interview_db_id: int) -> int:
+        """Сколько записей кодирования ссылается на фрагменты реплик интервью.
+
+        `fragment_coding.fragment_id` объявлен без `ON DELETE`, поэтому такие
+        строки тоже запрещают пересборку фрагментов.
+        """
+        if not self._table_exists("fragment_coding"):
+            return 0
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM fragment_coding c"
+            " JOIN fragment f ON c.fragment_id = f.id"
+            " JOIN utterance u ON f.utterance_id = u.id"
+            " WHERE u.interview_id = ?",
+            (interview_db_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def speaker_role_snapshot(self, interview_db_id: int) -> dict[str, str]:
         """Сохранённые роли: карта «метка говорящего -> роль»."""
         rows = self._conn.execute(

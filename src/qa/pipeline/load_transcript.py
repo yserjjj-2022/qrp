@@ -31,6 +31,23 @@ _LINE_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\t([^\t]+)\t(.*)$")
 _RESPONDENT_CODE_RE = re.compile(r"^R\d+$")
 _DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _DATE_DOTTED_RE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\b")
+# «03 ноября 2026 г.» — формат, в котором дату пишут в шапке протокола.
+# Регистр и наличие «г.»/«года» не важны; месяц сравнивается по основе слова.
+_DATE_RU_RE = re.compile(r"\b(\d{1,2})\s+([А-Яа-яЁё]+)\s+(\d{4})(?:\s*г(?:ода|\.)?)?")
+_MONTHS_RU: dict[str, int] = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
 
 # Фильтр шаблонов PII (CONSTITUTION §5): совпадения помечаются, не удаляются.
 # pii_flag только помечает: загрузка и отправка в модель не блокируются.
@@ -135,7 +152,7 @@ def parse_transcript(path: Path) -> tuple[str, list[TranscriptRecord]]:
 
 
 def parse_header_date(header: str) -> str | None:
-    """Дата интервью из заголовка: ISO или ДД.ММ.ГГГГ.
+    """Дата интервью из заголовка: ISO, ДД.ММ.ГГГГ или «03 ноября 2026 г.».
 
     Raises:
         TranscriptMetaError: дата выглядит некорректной.
@@ -155,6 +172,19 @@ def parse_header_date(header: str) -> str | None:
             return date(year, month, day).isoformat()
         except ValueError as exc:
             msg = f"Некорректная дата в заголовке транскрипта: {dotted.group(0)!r}"
+            raise TranscriptMetaError(msg) from exc
+    russian = _DATE_RU_RE.search(header)
+    if russian is not None:
+        day_text, month_text, year_text = russian.groups()
+        month_number = _MONTHS_RU.get(month_text.casefold())
+        if month_number is None:
+            # Слово после числа месяцем не является: это не дата, а обычный
+            # текст заголовка. Молчаливое None честнее ошибки разбора.
+            return None
+        try:
+            return date(int(year_text), month_number, int(day_text)).isoformat()
+        except ValueError as exc:
+            msg = f"Некорректная дата в заголовке транскрипта: {russian.group(0)!r}"
             raise TranscriptMetaError(msg) from exc
     return None
 

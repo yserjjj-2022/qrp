@@ -297,6 +297,12 @@ class TestMetaHelpers:
             ("Интервью R01, 2026-10-01", "2026-10-01"),
             ("Интервью, 01.10.2026", "2026-10-01"),
             ("Интервью без даты", None),
+            ("Интервью R02, 03 ноября 2026 г.", "2026-11-03"),
+            ("Интервью, 03 ноября 2026", "2026-11-03"),
+            ("Интервью, 3 ноября 2026 года", "2026-11-03"),
+            ("Интервью, 03 Ноября 2026 г.", "2026-11-03"),
+            ("Интервью, 1 мая 2026 г.", "2026-05-01"),
+            ("Интервью, 3 года спустя", None),
         ],
     )
     def test_parse_header_date(self, header: str, expected: str | None) -> None:
@@ -305,6 +311,10 @@ class TestMetaHelpers:
     def test_parse_header_date_invalid(self) -> None:
         with pytest.raises(TranscriptMetaError, match="Некорректная дата"):
             parse_header_date("Интервью, 2026-13-45")
+
+    def test_parse_header_date_russian_invalid_day(self) -> None:
+        with pytest.raises(TranscriptMetaError, match="Некорректная дата"):
+            parse_header_date("Интервью, 31 февраля 2026 г.")
 
     def test_respondent_code_from_filename(self, tmp_path: Path) -> None:
         assert respondent_code_from_filename(tmp_path / "R01.txt") == "R01"

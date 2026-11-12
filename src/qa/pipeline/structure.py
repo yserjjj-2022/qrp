@@ -740,6 +740,37 @@ def _unanswered_questions(
     ]
 
 
+def _check_rebuild_allowed(
+    repo: InterviewRepository,
+    interview_db_id: int,
+    interview_code: str,
+    annotations: int,
+    codings: int,
+) -> None:
+    """Запретить пересборку фрагментов, если на них ссылаются аннотации.
+
+    `annotation.fragment_id` и `fragment_coding.fragment_id` объявлены без
+    `ON DELETE`, поэтому `clear_fragments` упирается в сырую ошибку
+    `FOREIGN KEY constraint failed`. Заморозка разметки (CONSTITUTION §6) и так
+    запрещает молча удалять принятые аннотации: сообщаем это оператору, а не
+    показываем ошибку SQLite.
+    """
+    if not annotations and not codings:
+        return
+    parts: list[str] = []
+    if annotations:
+        parts.append(f"аннотации — {annotations}")
+    if codings:
+        parts.append(f"записи кодирования — {codings}")
+    msg = (
+        f"Интервью {interview_code}: пересборка фрагментов запрещена — на них ссылаются: "
+        + ", ".join(parts)
+        + ". Разметка заморожена (CONSTITUTION §6): принятые аннотации не удаляются пересборкой."
+        " Фрагменты остались прежними, БД не изменена"
+    )
+    raise StructureError(msg)
+
+
 def structure_interview(
     conn: sqlite3.Connection,
     interview_code: str,
@@ -799,6 +830,16 @@ def structure_interview(
             version,
         )
         rebuild = True
+
+    if rebuild:
+        interviews = InterviewRepository(conn)
+        _check_rebuild_allowed(
+            interviews,
+            interview_db_id,
+            interview_code,
+            interviews.annotation_refs_on_utterances(interview_db_id),
+            interviews.coding_refs_on_utterances(interview_db_id),
+        )
 
     utterances = structure.utterances_with_l2(interview_db_id, version)
     if not utterances:

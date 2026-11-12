@@ -604,6 +604,34 @@ class TestStructureRun:
         with pytest.raises(StructureError, match="L2"):
             structure_interview(db, "R01", _settings(), None)
 
+    def test_rebuild_blocked_by_annotations(self, seeded: tuple[sqlite3.Connection, int, dict[str, int]]) -> None:
+        """Пересборка при аннотациях даёт понятное сообщение, а не ошибку FK."""
+        conn, interview_id, _ids = seeded
+        structure_interview(conn, "R01", _settings(), None, code_version="test")
+        fragment_id = StructureRepository(conn).fragments_of_interview(interview_id)[0][0]
+        conn.execute("INSERT INTO codebook_version (file_hash) VALUES ('h2')")
+        code_version_id = int(conn.execute("SELECT MAX(id) FROM codebook_version").fetchone()[0])
+        conn.execute(
+            "INSERT INTO code (codebook_version_id, name) VALUES (?, 'RISK_01')",
+            (code_version_id,),
+        )
+        code_id = int(conn.execute("SELECT MAX(id) FROM code").fetchone()[0])
+        conn.execute(
+            "INSERT INTO annotation (fragment_id, code_id, quote, status) VALUES (?, ?, 'цитата', 'accepted')",
+            (fragment_id, code_id),
+        )
+        conn.commit()
+
+        with pytest.raises(StructureError, match="запрещена") as exc_info:
+            structure_interview(conn, "R01", _settings(), None, code_version="test", rebuild=True)
+
+        assert "FOREIGN KEY" not in str(exc_info.value)
+        assert "заморожена" in str(exc_info.value)
+        # Данные не тронуты: фрагменты и аннотация на месте.
+        assert len(StructureRepository(conn).fragments_of_interview(interview_id)) > 0
+        assert conn.execute("SELECT COUNT(*) FROM annotation").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 1
+
 
 class TestPrompts:
     """Промпты заполняются без незакрытых подстановок."""
