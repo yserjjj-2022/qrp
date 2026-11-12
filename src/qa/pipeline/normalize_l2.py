@@ -27,6 +27,7 @@ from qa.llm.errors import LlmError, LlmValidationError
 from qa.pipeline.normalize_rules import (
     _SOUND_TOKEN_RE,
     FILLER_PHRASES,
+    FUZZY_RELEVANCE_THRESHOLD,
     FuzzyConfig,
     LexiconEntry,
     comparison_tokens,
@@ -34,6 +35,7 @@ from qa.pipeline.normalize_rules import (
     is_service_word,
     lemma_of,
     normalize_deterministic,
+    relevant_lexicon,
     suspect_words,
 )
 
@@ -123,6 +125,7 @@ class NormalizeOutcome:
     model_used: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached: bool = False
 
 
 @dataclass(frozen=True)
@@ -133,6 +136,7 @@ class NormalizeStats:
     proposed: int = 0
     rejected: int = 0
     model_calls: int = 0
+    cached_calls: int = 0
     skipped_model: int = 0
     asr_quality: dict[str, int] = field(default_factory=dict)
     fillers_removed: int = 0
@@ -718,6 +722,8 @@ def normalize_utterance(
     fuzzy: FuzzyConfig | None = None,
     suspect: list[str] | None = None,
     domain_hint: str = "",
+    prompt_lexicon_filter: bool = False,
+    prompt_lexicon_threshold: float = FUZZY_RELEVANCE_THRESHOLD,
 ) -> NormalizeOutcome:
     """Нормализовать одну реплику.
 
@@ -735,6 +741,10 @@ def normalize_utterance(
         fuzzy: пороги нечёткого сопоставления с лексиконом.
         suspect: подозрительные слова (нет в словаре и лексиконе) для промпта.
         domain_hint: строка предметной области для промпта.
+        prompt_lexicon_filter: сузить подстановку `{lexicon}` до терминов,
+            релевантных реплике. Детерминированный проход и автопроверки
+            остаются на полном лексиконе.
+        prompt_lexicon_threshold: порог нечёткого отбора терминов для промпта.
     """
     # Нечёткая замена терминов — правило для реплик респондента. У интервьюера
     # формулировка нужна дословной, а его текст и так проходит точный лексикон.
@@ -755,10 +765,17 @@ def normalize_utterance(
     if provider is None or not should_use_model(role, is_backchannel, text, min_words):
         return outcome
 
+    # Фильтр считается только для реплик, которые реально идут в модель:
+    # для остальных подстановка не нужна.
+    prompt_lexicon = (
+        relevant_lexicon(deterministic.text, lexicon, suspect, prompt_lexicon_threshold)
+        if prompt_lexicon_filter
+        else lexicon
+    )
     prompt = build_prompt(
         deterministic.text,
         previous_question,
-        lexicon,
+        prompt_lexicon,
         markers,
         examples,
         suspect,
@@ -781,6 +798,7 @@ def normalize_utterance(
     outcome.model_used = result.model_used
     outcome.prompt_tokens = result.prompt_tokens
     outcome.completion_tokens = result.completion_tokens
+    outcome.cached = result.cached
     return _apply_model_output(outcome, deterministic.text, result.data, markers, lexicon)
 
 
@@ -951,6 +969,7 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
         proposed=sum(1 for item in outcomes if item.status == "proposed"),
         rejected=sum(1 for item in outcomes if item.status == "rejected"),
         model_calls=sum(1 for item in outcomes if item.used_model),
+        cached_calls=sum(1 for item in outcomes if item.cached),
         skipped_model=sum(1 for item in outcomes if not item.used_model),
         asr_quality=quality,
         fillers_removed=sum(item.fillers_removed for item in outcomes),

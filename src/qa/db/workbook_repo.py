@@ -730,6 +730,26 @@ class NewTermRepository:
         ).fetchall()
         return [(int(i), str(form), None if ctx is None else str(ctx)) for i, form, ctx in rows]
 
+    def ensure(self, surface_form: str, interview_id: int | None, context_utterance_id: int | None) -> bool:
+        """Добавить кандидата, если такой формы у интервью ещё нет.
+
+        `UNIQUE(surface_form, context_utterance_id)` не защищает от повторов при
+        `context_utterance_id IS NULL`: в SQLite два NULL считаются разными
+        значениями. Сбор `--suspects-only` пишет кандидатов без контекста,
+        поэтому повторный запуск иначе плодил бы дубли.
+
+        Returns:
+            True — строка вставлена, False — форма уже была.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM new_term WHERE surface_form = ? AND interview_id IS ? AND context_utterance_id IS ?",
+            (surface_form, interview_id, context_utterance_id),
+        ).fetchone()
+        if row is not None:
+            return False
+        self.add(surface_form, interview_id, context_utterance_id)
+        return True
+
     def proposed_on_current_l2(self) -> list[tuple[int, str, str | None]]:
         """Кандидаты, форма которых есть в актуальной версии L2 своего интервью.
 
@@ -746,6 +766,8 @@ class NewTermRepository:
         только ASCII, поэтому кириллица в SQL не понижается.
 
         Кандидат без реплики-контекста остаётся в очереди: проверить нечем.
+        Кандидат интервью, у которого ещё нет ни одной версии L2, тоже
+        остаётся: форма взята из L1 и реальна, а проверить её по L2 пока нечем.
         """
         rows = self._conn.execute(
             """
@@ -757,8 +779,9 @@ class NewTermRepository:
             """
         ).fetchall()
 
+        candidates = [int(row[3]) for row in rows if row[3] is not None]
         interview_texts: dict[int, str] = {}
-        for interview_id in {int(row[3]) for row in rows if row[3] is not None}:
+        for interview_id in set(candidates):
             units = self._conn.execute(
                 """
                 SELECT t.text FROM text_unit t JOIN utterance u ON u.id = t.utterance_id
@@ -772,10 +795,16 @@ class NewTermRepository:
             ).fetchall()
             interview_texts[interview_id] = " ".join(str(unit[0]) for unit in units).casefold()
 
+        # Интервью без L2 проверять нечем: кандидат остаётся в очереди.
+        without_l2 = {interview_id for interview_id in set(candidates) if not interview_texts.get(interview_id)}
+
         result: list[tuple[int, str, str | None]] = []
         for term_id, form, context, interview_id in rows:
             if context is None or interview_id is None:
                 result.append((int(term_id), str(form), None if context is None else str(context)))
+                continue
+            if int(interview_id) in without_l2:
+                result.append((int(term_id), str(form), str(context)))
                 continue
             if str(form).casefold() in interview_texts.get(int(interview_id), ""):
                 result.append((int(term_id), str(form), str(context)))
@@ -886,6 +915,21 @@ class TextUnitRepository:
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
+    def run_id_for_version(self, interview_db_id: int, version: int) -> int | None:
+        """Прогон, которым записана версия L2 интервью (None — записей нет).
+
+        Одна версия пишется одной транзакцией с одним `run_id`, поэтому
+        `DISTINCT` даёт одно значение. Несколько значений означали бы нарушение
+        этой инварианты; тогда берётся наименьший id как след первого прогона.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT t.run_id FROM text_unit t JOIN utterance u ON t.utterance_id = u.id"
+            " WHERE u.interview_id = ? AND t.version = ? AND t.run_id IS NOT NULL"
+            " ORDER BY t.run_id",
+            (interview_db_id, version),
+        ).fetchall()
+        return int(rows[0][0]) if rows else None
+
 
 class RunRepository:
     """Запись прогонов пайплайна."""
@@ -925,6 +969,21 @@ class RunRepository:
         без обновления в прогоне остался бы пустой алиас.
         """
         self._conn.execute("UPDATE run SET model = ? WHERE id = ?", (model, run_id))
+
+    def params(self, run_id: int) -> dict[str, Any]:
+        """Параметры прогона из `params_json`.
+
+        Пустой, отсутствующий или битый JSON даёт пустой словарь: прогоны до
+        появления ключа должны читаться как «параметра нет», а не падать.
+        """
+        row = self._conn.execute("SELECT params_json FROM run WHERE id = ?", (run_id,)).fetchone()
+        if row is None or row[0] is None:
+            return {}
+        try:
+            payload = json.loads(str(row[0]))
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
 
 @dataclass(frozen=True)

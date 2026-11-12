@@ -11,13 +11,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
 import pymorphy3
 from rapidfuzz import fuzz
+
+# Порог отбора терминов для промпта. Ниже порога замены (0.80): фильтр решает,
+# что показать модели, а не что исправить, поэтому ошибаться должен в сторону
+# включения лишнего термина.
+FUZZY_RELEVANCE_THRESHOLD = 0.6
 
 # Служебные слова: предлоги, союзы, частицы, местоимения. Только их повтор
 # считается механическим заиканием.
@@ -407,6 +414,117 @@ def suspect_words(text: str, entries: list[LexiconEntry]) -> list[str]:
         seen.add(folded)
         found.append(folded)
     return found
+
+
+def suspect_frequencies(text: str, entries: list[LexiconEntry]) -> dict[str, int]:
+    """Сколько раз каждое подозрительное слово встречается в тексте.
+
+    `suspect_words` возвращает уникальные формы: для списка в промпте этого
+    достаточно. При сборе глоссария нужна частота вхождений — она показывает,
+    какой термин стоит утверждать первым.
+    """
+    counts: dict[str, int] = {}
+    for form in suspect_words(text, entries):
+        counts[form] = 0
+    if not counts:
+        return counts
+    for match in _WORD_TOKEN_RE.finditer(text):
+        folded = _fold(match.group(0))
+        if folded in counts:
+            counts[folded] += 1
+    return counts
+
+
+def lexicon_snapshot(entries: Sequence[LexiconEntry]) -> str:
+    """Каноническое представление лексикона для хеша.
+
+    Порядок строк не зависит от порядка в БД, поэтому одинаковый набор
+    терминов всегда даёт одинаковый хеш.
+    """
+    lines = []
+    for entry in sorted(entries, key=lambda item: item.canonical.casefold()):
+        variants = ",".join(sorted(entry.variants, key=str.casefold))
+        lines.append(f"{entry.canonical}|{variants}")
+    return "\n".join(lines)
+
+
+def lexicon_snapshot_hash(entries: list[LexiconEntry]) -> str:
+    """SHA-256 от снимка лексикона: хеш версии глоссария для run.params_json."""
+    return hashlib.sha256(lexicon_snapshot(entries).encode("utf-8")).hexdigest()
+
+
+def lexicon_match_score(text: str, entry: LexiconEntry, threshold: float = FUZZY_RELEVANCE_THRESHOLD) -> int:
+    """Насколько термин близок к тексту: 2 — точное вхождение, 1 — нечёткое, 0 — нет.
+
+    Точное совпадение проверяется по канонической форме и вариантам как по
+    подстрокам с границами слова: термин «ребалансировка» не должен
+    считаться найденным в «ребалансировками» случайно, но словоформы
+    покрывает нечёткое сравнение.
+    """
+    folded_text = _fold(text)
+    for phrase in (entry.canonical, *entry.variants):
+        value = phrase.strip()
+        if not value:
+            continue
+        pattern = rf"(?<![а-яёa-z0-9]){re.escape(_fold(value))}(?![а-яёa-z0-9])"
+        if re.search(pattern, folded_text):
+            return 2
+    return 1 if _fuzzy_hit(folded_text, entry, threshold) else 0
+
+
+def _fuzzy_hit(folded_text: str, entry: LexiconEntry, threshold: float) -> bool:
+    """Есть ли в тексте слово, похожее на форму термина."""
+    forms = [_fold(entry.canonical)]
+    forms.extend(_fold(variant) for variant in entry.variants if variant.strip())
+    for match in _WORD_TOKEN_RE.finditer(folded_text):
+        token = match.group(0)
+        for form in forms:
+            if fuzz.ratio(token, form) / 100 >= threshold:
+                return True
+    return False
+
+
+def relevant_lexicon(
+    text: str,
+    entries: list[LexiconEntry],
+    suspect: list[str] | None = None,
+    threshold: float = FUZZY_RELEVANCE_THRESHOLD,
+) -> list[LexiconEntry]:
+    """Термины лексикона, релевантные тексту реплики, для подстановки в промпт.
+
+    Полный лексикон в каждом вызове делает промпт почти независимым от реплики
+    и обнуляет кэш при любом пополнении глоссария. В промпт идут только
+    термины, которые могут понадобиться этой реплике: точное вхождение формы
+    либо нечёткое сходство с подозрительным словом.
+
+    Фильтр намеренно шире порога замены: он отбирает кандидатов для модели,
+    а не принимает решение о замене. Детерминированный проход и автопроверки
+    работают с полным лексиконом.
+    """
+    suspects = suspect if suspect is not None else suspect_words(text, entries)
+    folded_text = _fold(text)
+    result: list[LexiconEntry] = []
+    for entry in entries:
+        if lexicon_match_score(folded_text, entry, threshold) > 0:
+            result.append(entry)
+            continue
+        if _matches_suspect(entry, suspects, threshold):
+            result.append(entry)
+    return result
+
+
+def _matches_suspect(entry: LexiconEntry, suspects: list[str], threshold: float) -> bool:
+    """Похож ли термин на одно из подозрительных слов реплики."""
+    if not suspects:
+        return False
+    forms = [_fold(entry.canonical)]
+    forms.extend(_fold(variant) for variant in entry.variants if variant.strip())
+    for suspect in suspects:
+        folded = _fold(suspect)
+        for form in forms:
+            if fuzz.ratio(folded, form) / 100 >= threshold:
+                return True
+    return False
 
 
 def _best_match(value: str, candidates: dict[str, str], threshold: float) -> tuple[str, str] | None:

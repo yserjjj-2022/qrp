@@ -14,10 +14,22 @@ import pytest
 
 from qa.db.connection import get_connection
 from qa.db.migrations import migrate
-from qa.db.workbook_repo import LexiconRepository, MarkerRepository, TextUnitRepository
+from qa.db.workbook_repo import (
+    LexiconRepository,
+    MarkerRepository,
+    NewTermRepository,
+    RunRepository,
+    TextUnitRepository,
+)
 from qa.llm.base import LlmProvider, LlmResult
 from qa.llm.errors import LlmValidationError
-from qa.pipeline.normalize import NormalizeError, normalize_interview, plan_dry_run
+from qa.pipeline.normalize import (
+    NormalizeError,
+    collect_suspects,
+    load_lexicon,
+    normalize_interview,
+    plan_dry_run,
+)
 from qa.pipeline.normalize_l2 import (
     NORMALIZE_SCHEMA,
     analyze_thought_loss,
@@ -34,6 +46,7 @@ from qa.pipeline.normalize_l2 import (
     normalize_utterance,
     run_checks,
     should_use_model,
+    summarize,
     surviving_new_terms,
 )
 from qa.pipeline.normalize_rules import (
@@ -41,9 +54,11 @@ from qa.pipeline.normalize_rules import (
     LexiconEntry,
     comparison_tokens,
     is_service_word,
+    lexicon_snapshot_hash,
     normalize_deterministic,
     suspect_words,
 )
+from qa.pipeline.review_terms import review_terms
 from qa.settings import Settings
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -57,12 +72,13 @@ _PROMPT_PLACEHOLDER = re.compile(r"\{[a-z_]+\}")
 class FakeProvider(LlmProvider):
     """Заглушка модели: отдаёт заданный ответ и считает вызовы."""
 
-    def __init__(self, responses: list[dict[str, Any] | Exception]) -> None:
+    def __init__(self, responses: list[dict[str, Any] | Exception], *, cached: bool = False) -> None:
         self._responses = list(responses)
         self.prompts: list[str] = []
         self.model_used = "fake-model"
         self.prompt_tokens = 10
         self.completion_tokens = 5
+        self.cached = cached
 
     def complete_json(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         return self.complete_json_detailed(prompt, schema).data
@@ -80,6 +96,7 @@ class FakeProvider(LlmProvider):
             model_used=self.model_used,
             prompt_tokens=self.prompt_tokens,
             completion_tokens=self.completion_tokens,
+            cached=self.cached,
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -1175,3 +1192,377 @@ class TestSchema:
             "punctuation",
             "garbled",
         ]
+
+
+# --- M7: аддитивный протокол глоссария -------------------------------------
+
+_OTHER_TERM = LexiconEntry(canonical="ребалансировка", variants=("реглантировка",))
+
+
+class TestPromptLexiconFilter:
+    """Фильтр сужает только подстановку {lexicon}; проверки остаются на полном."""
+
+    def test_irrelevant_terms_not_in_prompt(self) -> None:
+        provider = FakeProvider([_ok("Подключил MCP в приложении.")])
+        normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "подключил эсипи в приложении и всё работает",
+            previous_question=None,
+            lexicon=[*_LEXICON, _OTHER_TERM],
+            markers=_MARKERS,
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+            prompt_lexicon_filter=True,
+        )
+        prompt = provider.prompts[0]
+        assert "MCP" in prompt
+        assert "ребалансировка" not in prompt
+
+    def test_full_lexicon_without_filter(self) -> None:
+        provider = FakeProvider([_ok("Подключил MCP в приложении.")])
+        normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "подключил эсипи в приложении и всё работает",
+            previous_question=None,
+            lexicon=[*_LEXICON, _OTHER_TERM],
+            markers=_MARKERS,
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        prompt = provider.prompts[0]
+        assert "MCP" in prompt
+        assert "ребалансировка" in prompt
+
+    def test_checks_use_full_lexicon(self) -> None:
+        """Термин не попал в промпт, но проверка латиницы его всё равно знает."""
+        entries = [LexiconEntry(canonical="SuperApp", variants=("суперапп",))]
+        assert check_latin("пользуюсь суперапп постоянно", "Пользуюсь SuperApp.", entries) is None
+
+    def test_filter_does_not_call_lexicon_for_skipped_utterances(self) -> None:
+        """Реплика без вызова модели не должна вычислять фильтр."""
+        provider = FakeProvider([])
+        outcome = normalize_utterance(
+            1,
+            "INTERVIEWER",
+            False,
+            "расскажите подробно про подключение счёта",
+            previous_question=None,
+            lexicon=[*_LEXICON, _OTHER_TERM],
+            markers=_MARKERS,
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+            prompt_lexicon_filter=True,
+        )
+        assert provider.prompts == []
+        assert outcome.used_model is False
+
+
+class TestCachedCalls:
+    """Счётчик ответов из кэша."""
+
+    def test_cached_flag_propagated(self) -> None:
+        provider = FakeProvider([_ok("Я подключил счёт и всё работает.")], cached=True)
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "я подключил счёт и всё работает",
+            previous_question=None,
+            lexicon=[],
+            markers=[],
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        assert outcome.cached is True
+        assert summarize([outcome]).cached_calls == 1
+
+    def test_network_call_not_cached(self) -> None:
+        provider = FakeProvider([_ok("Я подключил счёт и всё работает.")])
+        outcome = normalize_utterance(
+            1,
+            "RESPONDENT",
+            False,
+            "я подключил счёт и всё работает",
+            previous_question=None,
+            lexicon=[],
+            markers=[],
+            examples="примеры",
+            provider=provider,
+            min_words=4,
+        )
+        assert outcome.cached is False
+        assert summarize([outcome]).cached_calls == 0
+
+    def test_cached_calls_recorded_in_run(self, db: sqlite3.Connection, settings: Settings) -> None:
+        _seed_interview(db, [("RESPONDENT", "я подключил счёт и всё работает", 0)])
+        _seed_reference(db)
+        provider = FakeProvider([_ok("Я подключил счёт и всё работает.")], cached=True)
+        result = normalize_interview(db, "R01", settings, provider)
+        assert result.stats.model_calls == 1
+        assert result.stats.cached_calls == 1
+        params = RunRepository(db).params(int(result.run_id or 0))
+        assert params["cached_calls"] == 1
+
+
+class TestLexiconHashInRun:
+    """Снимок лексикона фиксируется в params_json прогона."""
+
+    def test_hash_and_filter_settings_recorded(self, db: sqlite3.Connection, settings: Settings) -> None:
+        _seed_interview(db, [("RESPONDENT", "я подключил счёт и всё работает", 0)])
+        _seed_reference(db)
+        result = normalize_interview(db, "R01", settings, FakeProvider([_ok("Я подключил счёт и всё работает.")]))
+        params = RunRepository(db).params(int(result.run_id or 0))
+        assert params["lexicon_hash"] == lexicon_snapshot_hash(load_lexicon(db))
+        assert params["lexicon_terms"] == 1
+        assert params["prompt_lexicon_filter"] is True
+        assert params["prompt_lexicon_threshold"] == settings.m1b.prompt_lexicon_threshold
+
+    def test_hash_changes_with_variant(self, db: sqlite3.Connection, settings: Settings) -> None:
+        _seed_interview(db, [("RESPONDENT", "я подключил счёт и всё работает", 0)])
+        _seed_reference(db)
+        first = normalize_interview(db, "R01", settings, FakeProvider([_ok("Я подключил счёт и всё работает.")]))
+        LexiconRepository(db).add_variant("MCP", "мсипи")
+        db.commit()
+        second = normalize_interview(
+            db,
+            "R01",
+            settings,
+            FakeProvider([_ok("Я подключил счёт и всё работает.")]),
+            version=2,
+        )
+        first_params = RunRepository(db).params(int(first.run_id or 0))
+        second_params = RunRepository(db).params(int(second.run_id or 0))
+        assert first_params["lexicon_hash"] != second_params["lexicon_hash"]
+
+
+class TestLexiconFreeze:
+    """Заморозка L2: изменение лексикона не переписывает записанную версию."""
+
+    def test_freeze_warns_on_changed_lexicon(self, db: sqlite3.Connection, settings: Settings) -> None:
+        interview_id = _seed_interview(db, [("RESPONDENT", "я подключил счёт и всё работает", 0)])
+        _seed_reference(db)
+        normalize_interview(db, "R01", settings, FakeProvider([_ok("Я подключил счёт и всё работает.")]))
+        LexiconRepository(db).add_variant("MCP", "мсипи")
+        db.commit()
+
+        provider = FakeProvider([])
+        result = normalize_interview(db, "R01", settings, provider)
+
+        assert result.skipped is True
+        assert result.lexicon_changed is True
+        assert provider.prompts == []
+        row = db.execute(
+            "SELECT COUNT(*) FROM text_unit t JOIN utterance u ON t.utterance_id = u.id WHERE u.interview_id = ?",
+            (interview_id,),
+        ).fetchone()
+        assert row is not None and int(row[0]) == 1
+
+    def test_freeze_silent_without_hash(self, db: sqlite3.Connection, settings: Settings) -> None:
+        """Прогон до M7 не писал lexicon_hash: расхождением это не считается."""
+        interview_id = _seed_interview(db, [("RESPONDENT", "я подключил счёт и всё работает", 0)])
+        _seed_reference(db)
+        normalize_interview(db, "R01", settings, FakeProvider([_ok("Я подключил счёт и всё работает.")]))
+        db.execute("UPDATE run SET params_json = '{\"version\": 1}'")
+        db.commit()
+        LexiconRepository(db).add_variant("MCP", "мсипи")
+        db.commit()
+
+        result = normalize_interview(db, "R01", settings, FakeProvider([]))
+
+        assert result.skipped is True
+        assert result.lexicon_changed is False
+        assert result.lexicon_run_hash == ""
+        assert TextUnitRepository(db).count_for_interview(interview_id, 1) == 1
+
+    def test_new_version_keeps_old_units(self, db: sqlite3.Connection, settings: Settings) -> None:
+        interview_id = _seed_interview(db, [("RESPONDENT", "я подключил счёт и всё работает", 0)])
+        _seed_reference(db)
+        normalize_interview(db, "R01", settings, FakeProvider([_ok("Я подключил счёт и всё работает.")]))
+        LexiconRepository(db).add_variant("MCP", "мсипи")
+        db.commit()
+
+        result = normalize_interview(
+            db,
+            "R01",
+            settings,
+            FakeProvider([_ok("Я подключил счёт, всё работает.")]),
+            version=2,
+        )
+
+        assert result.skipped is False
+        assert result.lexicon_changed is False
+        assert TextUnitRepository(db).count_for_interview(interview_id, 1) == 1
+        assert TextUnitRepository(db).count_for_interview(interview_id, 2) == 1
+
+    def test_run_id_for_version(self, db: sqlite3.Connection, settings: Settings) -> None:
+        interview_id = _seed_interview(db, [("RESPONDENT", "я подключил счёт и всё работает", 0)])
+        _seed_reference(db)
+        result = normalize_interview(db, "R01", settings, FakeProvider([_ok("Я подключил счёт и всё работает.")]))
+        repo = TextUnitRepository(db)
+        assert repo.run_id_for_version(interview_id, 1) == result.run_id
+        assert repo.run_id_for_version(interview_id, 2) is None
+
+    def test_params_of_missing_run(self, db: sqlite3.Connection) -> None:
+        assert RunRepository(db).params(999) == {}
+
+
+class TestCollectSuspects:
+    """Предварительный сбор слов без модели: только new_term."""
+
+    def test_candidates_written_without_run_or_l2(self, db: sqlite3.Connection, settings: Settings) -> None:
+        _seed_interview(
+            db,
+            [
+                ("RESPONDENT", "Там автослеле и нечечно работает", 0),
+                ("INTERVIEWER", "Расскажите подробнее про подключение", 0),
+            ],
+        )
+        _seed_reference(db)
+
+        report = collect_suspects(db, "R01", settings)
+
+        assert [form for form, _count in report.forms] == ["автослеле", "нечечно"]
+        assert report.total == 2
+        assert report.added == 2
+        assert db.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM text_unit").fetchone()[0] == 0
+        forms = {row[0] for row in db.execute("SELECT surface_form FROM new_term").fetchall()}
+        assert forms == {"автослеле", "нечечно"}
+
+    def test_short_respondent_utterance_included(self, db: sqlite3.Connection, settings: Settings) -> None:
+        """Порог min_words_for_model не применяется: цель — собрать словарь."""
+        _seed_interview(db, [("RESPONDENT", "автослеле", 0)])
+        _seed_reference(db)
+
+        report = collect_suspects(db, "R01", settings)
+
+        assert [form for form, _count in report.forms] == ["автослеле"]
+
+    def test_repeated_form_counted(self, db: sqlite3.Connection, settings: Settings) -> None:
+        """Частота — число вхождений формы по всем репликам респондента."""
+        _seed_interview(
+            db,
+            [
+                ("RESPONDENT", "нечечно там нечечно опять", 0),
+                ("RESPONDENT", "и снова нечечно", 0),
+            ],
+        )
+        _seed_reference(db)
+
+        report = collect_suspects(db, "R01", settings)
+
+        assert report.forms == [("нечечно", 3)]
+        assert report.total == 3
+        assert report.added == 1
+
+    def test_repeat_run_adds_nothing(self, db: sqlite3.Connection, settings: Settings) -> None:
+        """Повторный сбор не плодит дублей при context_utterance_id IS NULL."""
+        _seed_interview(db, [("RESPONDENT", "Там автослеле работает", 0)])
+        _seed_reference(db)
+        collect_suspects(db, "R01", settings)
+
+        second = collect_suspects(db, "R01", settings)
+
+        assert second.added == 0
+        assert db.execute("SELECT COUNT(*) FROM new_term").fetchone()[0] == 1
+
+    def test_unknown_interview(self, db: sqlite3.Connection, settings: Settings) -> None:
+        with pytest.raises(NormalizeError, match="не найдено"):
+            collect_suspects(db, "R99", settings)
+
+
+class TestReviewQueueWithoutL2:
+    """Очередь review-terms: кандидат интервью без L2 не выбрасывается."""
+
+    def _seed_interview_with_utterance(self, conn: sqlite3.Connection, code: str) -> int:
+        cursor = conn.execute("INSERT INTO interview (id_external, name) VALUES (?, 'тест')", (code,))
+        interview_id = int(cursor.lastrowid or 0)
+        cursor = conn.execute(
+            "INSERT INTO utterance (interview_id, speaker_role, text, turn_ids) VALUES (?, 'RESPONDENT', ?, '[]')",
+            (interview_id, "текст реплики"),
+        )
+        return int(cursor.lastrowid or 0)
+
+    def test_candidate_without_l2_stays(self, db: sqlite3.Connection) -> None:
+        utterance_id = self._seed_interview_with_utterance(db, "R02")
+        NewTermRepository(db).add("автослеле", 1, utterance_id)
+        db.commit()
+
+        queue = NewTermRepository(db).proposed_on_current_l2()
+
+        assert [form for _id, form, _ctx in queue] == ["автослеле"]
+
+    def test_candidate_absent_from_existing_l2_dropped(self, db: sqlite3.Connection) -> None:
+        """Регрессия: при наличии L2 поведение прежнее."""
+        utterance_id = self._seed_interview_with_utterance(db, "R01")
+        db.execute(
+            "INSERT INTO text_unit (utterance_id, version, text) VALUES (?, 1, ?)",
+            (utterance_id, "Подключил MCP Финам."),
+        )
+        NewTermRepository(db).add("автослеле", 1, utterance_id)
+        db.commit()
+
+        assert NewTermRepository(db).proposed_on_current_l2() == []
+
+    def test_review_terms_asks_candidate_without_l2(self, db: sqlite3.Connection) -> None:
+        utterance_id = self._seed_interview_with_utterance(db, "R02")
+        NewTermRepository(db).add("автослеле", 1, utterance_id)
+        db.commit()
+
+        result = review_terms(db, ask=lambda _prompt: "n")
+
+        assert result.stale == 0
+        assert result.rejected == ["автослеле"]
+
+
+class TestSuspectsOnlyCli:
+    """`normalize --suspects-only` печатает формы и не создаёт версию L2."""
+
+    def _run(
+        self,
+        db: sqlite3.Connection,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import argparse
+
+        from qa import cli
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr(cli, "_open_db", lambda _settings: db)
+        args = argparse.Namespace(interview="R01", suspects_only=True, dry_run=False, new_version=False)
+        assert cli.cmd_normalize(args) == 0
+
+    def test_prints_forms_and_creates_no_l2(
+        self,
+        db: sqlite3.Connection,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _seed_interview(db, [("RESPONDENT", "Там автослеле и нечечно работает", 0)])
+        _seed_reference(db)
+        db_path = Path(str(db.execute("PRAGMA database_list").fetchone()[2]))
+
+        self._run(db, settings, monkeypatch)
+
+        out = capsys.readouterr().out
+        assert "форм=2" in out
+        assert "вхождений=2" in out
+        assert "автослеле" in out
+        # Команда закрывает соединение; проверяем результат новым подключением.
+        check = sqlite3.connect(db_path)
+        try:
+            assert check.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+            assert check.execute("SELECT COUNT(*) FROM text_unit").fetchone()[0] == 0
+            assert check.execute("SELECT COUNT(*) FROM new_term").fetchone()[0] == 2
+        finally:
+            check.close()

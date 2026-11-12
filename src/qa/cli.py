@@ -11,6 +11,10 @@ from qa.db.migrations import migrate
 from qa.log import setup_logging
 from qa.settings import Settings, load_env_file
 
+# Сколько форм показывает `normalize --suspects-only`: список бывает длинным
+# (на одном интервью — около двухсот форм), полный вывод не нужен.
+_SUSPECTS_PREVIEW = 20
+
 
 def _load_settings() -> Settings:
     """Загрузить .env (если есть) и настройки проекта."""
@@ -274,21 +278,38 @@ def cmd_llm_ping(args: argparse.Namespace) -> int:
 def cmd_normalize(args: argparse.Namespace) -> int:
     """Нормализовать реплики интервью в слой L2."""
     from qa.llm.errors import LlmConfigError, LlmError
-    from qa.pipeline.normalize import NormalizeError, normalize_interview, plan_dry_run
+    from qa.pipeline.normalize import (
+        NormalizeError,
+        collect_suspects,
+        normalize_interview,
+        plan_dry_run,
+    )
     from qa.version import code_version
 
     settings = _load_settings()
     run_id = setup_logging(settings.log_level)
     conn = _open_db(settings)
     try:
-        if args.dry_run:
-            report = plan_dry_run(conn, args.interview, settings)
+        if args.suspects_only:
+            suspects = collect_suspects(conn, args.interview, settings)
             print(
-                f"[{run_id}] normalize dry-run {report.interview_code}: реплик={report.utterances}, "
-                f"вызовов модели={report.model_calls}, оценка токенов промпта={report.prompt_tokens}, "
+                f"[{run_id}] normalize --suspects-only {suspects.interview_code}: реплик={suspects.utterances}, "
+                f"форм={len(suspects.forms)}, вхождений={suspects.total}, новых кандидатов={suspects.added}"
+            )
+            for form, count in suspects.forms[:_SUSPECTS_PREVIEW]:
+                print(f"  {form}: {count}")
+            if len(suspects.forms) > _SUSPECTS_PREVIEW:
+                print(f"  ... ещё {len(suspects.forms) - _SUSPECTS_PREVIEW} форм")
+            return 0
+
+        if args.dry_run:
+            estimate = plan_dry_run(conn, args.interview, settings)
+            print(
+                f"[{run_id}] normalize dry-run {estimate.interview_code}: реплик={estimate.utterances}, "
+                f"вызовов модели={estimate.model_calls}, оценка токенов промпта={estimate.prompt_tokens}, "
                 f"отправлено=0"
             )
-            if report.already_done:
+            if estimate.already_done:
                 print("  L2 версии 1 уже записан: без --new-version команда ничего не сделает")
             return 0
 
@@ -326,6 +347,12 @@ def cmd_normalize(args: argparse.Namespace) -> int:
 
     if result.skipped:
         print(f"[{run_id}] normalize {result.interview_code}: L2 версии {result.version} уже записан, дублей нет")
+        if result.lexicon_changed:
+            print(
+                f"  лексикон изменился с момента записи: L2 v{result.version} заморожен на снимке "
+                f"{result.lexicon_run_hash[:12]}, текущий {result.lexicon_current_hash[:12]}. "
+                f"Изменения не применены, для применения нужен --new-version"
+            )
         return 0
 
     stats = result.stats
@@ -335,7 +362,7 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     print(
         f"[{run_id}] normalize {result.interview_code} (L2 v{result.version}): реплик={stats.total}, "
         f"proposed={stats.proposed}, rejected={stats.rejected}, вызовов={stats.model_calls}, "
-        f"модель={result.model_used or '—'}"
+        f"из кэша={stats.cached_calls}, модель={result.model_used or '—'}"
     )
     print(f"  asr_quality: {quality}")
     print(
@@ -669,6 +696,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_norm.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
     p_norm.add_argument("--dry-run", action="store_true", help="Посчитать объём работы без вызовов модели")
     p_norm.add_argument("--new-version", action="store_true", help="Создать новую версию L2")
+    p_norm.add_argument(
+        "--suspects-only",
+        action="store_true",
+        help="Собрать подозрительные слова без модели и записать кандидатов в new_term",
+    )
     p_norm.add_argument("--review-export", action="store_true", help="Выгрузить файл ручной проверки L2")
     p_norm.set_defaults(func=cmd_normalize)
 

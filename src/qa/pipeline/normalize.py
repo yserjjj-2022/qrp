@@ -34,7 +34,12 @@ from qa.pipeline.normalize_l2 import (
     surviving_new_terms,
     word_count,
 )
-from qa.pipeline.normalize_rules import LexiconEntry
+from qa.pipeline.normalize_rules import (
+    LexiconEntry,
+    lexicon_snapshot_hash,
+    normalize_deterministic,
+    suspect_frequencies,
+)
 from qa.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -56,6 +61,22 @@ class NormalizeResult:
     run_id: int | None = None
     model_used: str = ""
     outcomes: list[NormalizeOutcome] = field(default_factory=list)
+    # Снимок лексикона, на котором записана версия, отличается от текущего:
+    # L2 не перезаписан, для применения нужен --new-version.
+    lexicon_changed: bool = False
+    lexicon_run_hash: str = ""
+    lexicon_current_hash: str = ""
+
+
+@dataclass(frozen=True)
+class SuspectReport:
+    """Итог предварительного сбора подозрительных слов без модели."""
+
+    interview_code: str
+    utterances: int
+    forms: list[tuple[str, int]]
+    total: int
+    added: int
 
 
 @dataclass(frozen=True)
@@ -157,12 +178,25 @@ def normalize_interview(
     text_units = TextUnitRepository(conn)
     if text_units.count_for_interview(interview_db_id, version) > 0:
         logger.info("L2 версии %d для %s уже записан, пропуск", version, interview_code)
+        current_hash = lexicon_snapshot_hash(load_lexicon(conn))
+        frozen_hash, changed = _lexicon_changed(conn, interview_db_id, version, current_hash)
+        if changed:
+            logger.warning(
+                "L2 v%d для %s заморожен на снимке лексикона %s, текущий %s: изменения не применены",
+                version,
+                interview_code,
+                frozen_hash[:12],
+                current_hash[:12],
+            )
         return NormalizeResult(
             interview_code=interview_code,
             interview_db_id=interview_db_id,
             version=version,
             stats=NormalizeStats(),
             skipped=True,
+            lexicon_changed=changed,
+            lexicon_run_hash=frozen_hash,
+            lexicon_current_hash=current_hash,
         )
 
     lexicon = load_lexicon(conn)
@@ -186,6 +220,8 @@ def normalize_interview(
             min_words=min_words,
             fuzzy=fuzzy,
             domain_hint=settings.domain_hint,
+            prompt_lexicon_filter=settings.m1b.prompt_lexicon_filter,
+            prompt_lexicon_threshold=settings.m1b.prompt_lexicon_threshold,
         )
         outcomes.append(outcome)
 
@@ -198,8 +234,12 @@ def normalize_interview(
         "min_words_for_model": min_words,
         "temperature": 0,
         "lexicon_terms": len(lexicon),
+        "lexicon_hash": lexicon_snapshot_hash(lexicon),
+        "prompt_lexicon_filter": settings.m1b.prompt_lexicon_filter,
+        "prompt_lexicon_threshold": settings.m1b.prompt_lexicon_threshold,
         "markers": len(markers),
         "model_calls": stats.model_calls,
+        "cached_calls": stats.cached_calls,
     }
 
     conn.execute("SAVEPOINT normalize_l2")
@@ -261,6 +301,76 @@ def load_prompt_text() -> str:
     return load_prompt()
 
 
+def _lexicon_changed(
+    conn: sqlite3.Connection,
+    interview_db_id: int,
+    version: int,
+    current_hash: str,
+) -> tuple[str, bool]:
+    """Снимок лексикона записанной версии L2 и признак «лексикон с тех пор изменился».
+
+    Прогоны до M7 не писали `lexicon_hash`. Для них сравнение невозможно, и
+    расхождением это не считается: иначе на уже обработанных интервью было бы
+    ложное предупреждение.
+    """
+    run_id = TextUnitRepository(conn).run_id_for_version(interview_db_id, version)
+    if run_id is None:
+        return "", False
+    frozen_hash = str(RunRepository(conn).params(run_id).get("lexicon_hash") or "")
+    if not frozen_hash:
+        logger.info("L2 v%d записан прогоном без lexicon_hash: сравнение снимков пропущено", version)
+        return "", False
+    return frozen_hash, frozen_hash != current_hash
+
+
+def collect_suspects(
+    conn: sqlite3.Connection,
+    interview_code: str,
+    settings: Settings,
+) -> SuspectReport:
+    """Собрать подозрительные слова интервью без вызовов модели.
+
+    Цель — пополнить глоссарий до прогона: слова, которых нет ни в словаре,
+    ни в лексиконе, видны уже на L1. Порог `min_words_for_model` здесь не
+    применяется: короткая реплика тоже может содержать искажение. Ни `run`,
+    ни `text_unit` не создаются — это подготовительный шаг, а не версия L2.
+    """
+    interview_db_id = InterviewRepository(conn).interview_db_id_by_code(interview_code)
+    if interview_db_id is None:
+        msg = f"Интервью {interview_code} не найдено в БД: сначала загрузите транскрипт"
+        raise NormalizeError(msg)
+    utterances = InterviewRepository(conn).utterances_for_normalize(interview_db_id)
+    if not utterances:
+        msg = f"У интервью {interview_code} нет реплик: сначала загрузите транскрипт"
+        raise NormalizeError(msg)
+
+    lexicon = load_lexicon(conn)
+    fuzzy = settings.m1b.fuzzy_config()
+    counts: dict[str, int] = {}
+    for _utterance_id, role, text, _flag in utterances:
+        if role != "RESPONDENT":
+            continue
+        deterministic = normalize_deterministic(text, lexicon, fuzzy)
+        for form, count in suspect_frequencies(deterministic.text, lexicon).items():
+            counts[form] = counts.get(form, 0) + count
+
+    terms = NewTermRepository(conn)
+    added = 0
+    for form in counts:
+        if terms.ensure(form, interview_db_id, None):
+            added += 1
+    conn.commit()
+
+    forms = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return SuspectReport(
+        interview_code=interview_code,
+        utterances=sum(1 for _uid, role, _text, _flag in utterances if role == "RESPONDENT"),
+        forms=forms,
+        total=sum(counts.values()),
+        added=added,
+    )
+
+
 def _model_label(
     provider: LlmProvider | None,
     settings: Settings,
@@ -284,6 +394,8 @@ __all__ = [
     "DryRunReport",
     "NormalizeError",
     "NormalizeResult",
+    "SuspectReport",
+    "collect_suspects",
     "count_words",
     "load_lexicon",
     "load_markers",

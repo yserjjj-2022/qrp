@@ -102,6 +102,11 @@ class M1bSettings(BaseModel):
     len_ratio_min: float = Field(default=0.6, gt=0)
     len_ratio_max: float = Field(default=1.1, gt=0)
     review_sample_share: float = Field(default=0.10, ge=0, le=1)
+    # Фильтрация лексикона в промпте: в вызов уходят только термины, похожие на
+    # текст реплики. Полный лексикон в каждом промпте делал ключ кэша
+    # зависимым от всего глоссария, поэтому пополнение обнуляло кэш интервью.
+    prompt_lexicon_filter: bool = True
+    prompt_lexicon_threshold: float = Field(default=0.60, gt=0, le=1)
 
     def fuzzy_config(self) -> FuzzyConfig:
         """Пороги нечёткого сопоставления для детерминированного прохода."""
