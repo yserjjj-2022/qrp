@@ -582,6 +582,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
     from qa.dashboard.render import render_dashboard
     from qa.pipeline.aggregate import AggregateError, build_coverage
+    from qa.pipeline.quote_view import quote_editor_from_settings
 
     settings = _load_settings(_db_from_args(args))
     run_id = setup_logging(settings.log_level)
@@ -595,6 +596,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             high_min=settings.m4.theme_high_min_annotations,
             quotes_per_theme=settings.m4.quotes_per_theme,
             quote_max_chars=settings.m4.quote_max_chars,
+            quote_editor=quote_editor_from_settings(settings),
+            quote_min_chars=settings.m8.quote_min_chars,
         )
     except AggregateError as exc:
         print(f"[{run_id}] dashboard: ошибка — {exc}")
@@ -625,6 +628,8 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     from qa.db.analytics_repo import AnalyticsRepository
     from qa.pipeline.aggregate import AggregateError, build_coverage
+    from qa.pipeline.quote_view import quote_editor_from_settings
+    from qa.report.limitations import pipeline_limitations
     from qa.report.model import build_report
     from qa.report.render import render_report
 
@@ -640,9 +645,18 @@ def cmd_report(args: argparse.Namespace) -> int:
             high_min=settings.m4.theme_high_min_annotations,
             quotes_per_theme=settings.m4.quotes_per_theme,
             quote_max_chars=settings.m4.quote_max_chars,
+            quote_editor=quote_editor_from_settings(settings),
+            quote_min_chars=settings.m8.quote_min_chars,
         )
         snapshot = args.snapshot_date or date.today().isoformat()
-        report = build_report(coverage, AnalyticsRepository(conn), snapshot_date=snapshot)
+        report = build_report(
+            coverage,
+            AnalyticsRepository(conn),
+            snapshot_date=snapshot,
+            settings=settings,
+            extra_limitations=pipeline_limitations(conn, args.interview, settings),
+            quote_editor=quote_editor_from_settings(settings),
+        )
     except AggregateError as exc:
         print(f"[{run_id}] report: ошибка — {exc}")
         return 1
@@ -659,6 +673,145 @@ def cmd_report(args: argparse.Namespace) -> int:
         f"[{run_id}] report {report.provenance.interview_code}: "
         f"аннотаций={report.annotations_total} (проверено вручную {report.annotations_verified}), "
         f"ограничений={len(report.limitations)}, прогонов={len(report.provenance.runs)} -> {output}"
+    )
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Довести интервью по конвейеру до следующего шага или ворот (M8)."""
+    from qa.pipeline.orchestrate import (
+        PipelineRunner,
+        format_run_result,
+        warn_names_map,
+    )
+
+    settings = _load_settings(_db_from_args(args))
+    run_id = setup_logging(settings.log_level)
+    conn = _open_db(settings)
+    try:
+        runner = PipelineRunner(conn, args.interview, settings, skip_terms=args.skip_terms)
+        if args.dry_run:
+            plan = runner.plan()
+            print(f"[{run_id}] run {args.interview} dry-run: записи в БД не будет")
+            for step in plan:
+                mark = {
+                    "done": "предстоит",
+                    "skipped": "сделано",
+                    "gate": "ворота",
+                    "blocked": "заблокировано",
+                }.get(step.status, step.status)
+                print(f"  {step.number}. {step.title}: {mark} — {step.detail}")
+            return 0
+        result = runner.execute()
+    except Exception as exc:  # noqa: BLE001 - стадии бросают разные типы ошибок
+        print(f"[{run_id}] run: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    for index, line in enumerate(format_run_result(result)):
+        print(f"[{run_id}] {line}" if index == 0 else line)
+    if result.stopped_at_gate == 4:
+        warning = warn_names_map()
+        if warning is not None:
+            print(f"  ! {warning}")
+    return 0
+
+
+def cmd_export_terms(args: argparse.Namespace) -> int:
+    """Выгрузить таблицу терминов интервью для коллег (M8)."""
+    from qa.pipeline.orchestrate import warn_names_map
+    from qa.pipeline.terms_table import export_terms_table
+
+    settings = _load_settings(_db_from_args(args))
+    run_id = setup_logging(settings.log_level)
+    output = Path(args.output) if args.output else Path(settings.paths.exports) / f"terms_{args.interview}.xlsx"
+    conn = _open_db(settings)
+    try:
+        result = export_terms_table(conn, args.interview, output)
+    except ValueError as exc:
+        print(f"[{run_id}] export-terms: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+    print(
+        f"[{run_id}] таблица терминов {args.interview}: строк={result.n_rows} "
+        f"(одиночных={result.n_single}) -> {result.path}"
+    )
+    warning = warn_names_map()
+    if warning is not None:
+        print(f"  ! {warning}")
+    return 0
+
+
+def cmd_import_terms(args: argparse.Namespace) -> int:
+    """Прочитать заполненную таблицу терминов и пополнить лексикон (M8)."""
+    from qa.pipeline.terms_table import import_terms_table
+
+    settings = _load_settings(_db_from_args(args))
+    run_id = setup_logging(settings.log_level)
+    path = Path(args.file) if args.file else Path(settings.paths.exports) / f"terms_{args.interview}.xlsx"
+    conn = _open_db(settings)
+    try:
+        result = import_terms_table(conn, path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"[{run_id}] import-terms: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+    print(
+        f"[{run_id}] таблица терминов импортирована: строк={result.n_rows}, "
+        f"вариантов в лексикон={result.n_variants}, без решения={result.n_skipped}"
+    )
+    for form, canonical in result.variants:
+        print(f"  вариант: {form!r} -> {canonical}")
+    return 0
+
+
+def cmd_export_quality_sample(args: argparse.Namespace) -> int:
+    """Выгрузить выборку 10–15 реплик для проверки качества L2 (M8)."""
+    from qa.pipeline.quality_sample import export_quality_sample, quality_sample_path
+
+    settings = _load_settings(_db_from_args(args))
+    run_id = setup_logging(settings.log_level)
+    output = Path(args.output) if args.output else quality_sample_path(Path(settings.paths.exports), args.interview)
+    conn = _open_db(settings)
+    try:
+        result = export_quality_sample(
+            conn,
+            args.interview,
+            output,
+            min_rows=settings.m8.quality_sample_min,
+            max_rows=settings.m8.quality_sample_max,
+        )
+    except ValueError as exc:
+        print(f"[{run_id}] export-quality-sample: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+    print(f"[{run_id}] выборка качества {args.interview}: реплик={result.n_rows} -> {result.path}")
+    return 0
+
+
+def cmd_import_quality_sample(args: argparse.Namespace) -> int:
+    """Прочитать решения выборки качества и посчитать долю принятых без правок (M8)."""
+    from qa.pipeline.quality_sample import import_quality_sample, quality_sample_path
+
+    settings = _load_settings(_db_from_args(args))
+    run_id = setup_logging(settings.log_level)
+    path = Path(args.file) if args.file else quality_sample_path(Path(settings.paths.exports), args.interview)
+    conn = _open_db(settings)
+    try:
+        result = import_quality_sample(conn, path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"[{run_id}] import-quality-sample: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+    share = "—" if result.approved_share is None else f"{result.approved_share:.3f}"
+    print(
+        f"[{run_id}] решения выборки качества: принято={result.approved}, исправлено={result.edited}, "
+        f"отклонено={result.rejected}, без решения={result.skipped}, доля принятых без правок={share}"
     )
     return 0
 
@@ -766,6 +919,51 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--snapshot-date", help="Дата снимка чисел (ISO); по умолчанию сегодня")
     _add_db_option(p_report)
     p_report.set_defaults(func=cmd_report)
+
+    p_run = subparsers.add_parser("run", help="Довести интервью по конвейеру до следующего шага или ворот (M8)")
+    p_run.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_run.add_argument("--dry-run", action="store_true", help="Показать план шагов без записи в БД")
+    p_run.add_argument(
+        "--skip-terms",
+        action="store_true",
+        help="Пройти ворота 1 без таблицы терминов: кандидаты остаются proposed",
+    )
+    _add_db_option(p_run)
+    p_run.set_defaults(func=cmd_run)
+
+    p_export_terms = subparsers.add_parser("export-terms", help="Выгрузить таблицу терминов интервью (M8)")
+    p_export_terms.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_export_terms.add_argument("--output", help="Путь к xlsx; по умолчанию data/exports/terms_<код>.xlsx")
+    _add_db_option(p_export_terms)
+    p_export_terms.set_defaults(func=cmd_export_terms)
+
+    p_import_terms = subparsers.add_parser("import-terms", help="Импортировать заполненную таблицу терминов (M8)")
+    p_import_terms.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_import_terms.add_argument("file", nargs="?", help="Путь к xlsx; по умолчанию data/exports/terms_<код>.xlsx")
+    _add_db_option(p_import_terms)
+    p_import_terms.set_defaults(func=cmd_import_terms)
+
+    p_export_quality = subparsers.add_parser(
+        "export-quality-sample",
+        help="Выгрузить выборку 10–15 реплик для проверки качества L2 (M8)",
+    )
+    p_export_quality.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_export_quality.add_argument("--output", help="Путь к xlsx; по умолчанию data/exports/quality_sample_<код>.xlsx")
+    _add_db_option(p_export_quality)
+    p_export_quality.set_defaults(func=cmd_export_quality_sample)
+
+    p_import_quality = subparsers.add_parser(
+        "import-quality-sample",
+        help="Записать решения выборки качества и посчитать долю принятых без правок (M8)",
+    )
+    p_import_quality.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")
+    p_import_quality.add_argument(
+        "file",
+        nargs="?",
+        help="Путь к xlsx; по умолчанию data/exports/quality_sample_<код>.xlsx",
+    )
+    _add_db_option(p_import_quality)
+    p_import_quality.set_defaults(func=cmd_import_quality_sample)
 
     return parser
 
