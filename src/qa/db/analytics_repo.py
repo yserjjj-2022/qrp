@@ -93,6 +93,10 @@ class AnnotationRow:
     `verified` — признак ручной проверки: статус `accepted` или `edited`.
     Непроверенные (`proposed`) входят в агрегаты наравне: выборочный контроль
     не является фильтром, иначе числа описывают подвыборку, а не разметку.
+
+    `timecode` — тайм-код реплики в секундах (`MIN(turn.start_sec)` по её
+    записям), `l1_text` — исходный текст реплики L1. Оба нужны отчёту, чтобы
+    рядом с цитатой стоял проверяемый оригинал (SPEC-M8, C.4).
     """
 
     id: int
@@ -109,6 +113,8 @@ class AnnotationRow:
     question_identifier: str | None
     verified: bool
     interpretation_only: bool
+    timecode: int | None = None
+    l1_text: str = ""
 
 
 def run_stage(params: dict[str, Any]) -> str:
@@ -299,7 +305,8 @@ class AnalyticsRepository:
         rows = self._conn.execute(
             'SELECT a.id, a.code_id, a.fragment_id, f.utterance_id, f."start", a.quote,'
             " a.quote_start, a.quote_end, a.reliability, f.asr_quality, t.text, q.identifier,"
-            " a.status, a.interpretation_only"
+            " a.status, a.interpretation_only, u.text,"
+            " (SELECT MIN(turn.start_sec) FROM turn, json_each(u.turn_ids) j WHERE turn.id = j.value)"
             " FROM annotation a"
             " JOIN fragment f ON f.id = a.fragment_id"
             " JOIN utterance u ON u.id = f.utterance_id"
@@ -325,6 +332,8 @@ class AnalyticsRepository:
                 question_identifier=None if row[11] is None else str(row[11]),
                 verified=str(row[12]) in ("accepted", "edited"),
                 interpretation_only=bool(row[13]),
+                l1_text=str(row[14]),
+                timecode=None if row[15] is None else int(row[15]),
             )
             for row in rows
         ]
