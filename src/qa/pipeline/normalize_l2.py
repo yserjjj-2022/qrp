@@ -154,6 +154,7 @@ class NormalizeStats:
     doubtful: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    manual_edits: int = 0
 
 
 def load_prompt(name: str = "normalize.md") -> str:
@@ -945,6 +946,7 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
     soft_thought_loss = 0
     fuzzy_replacements = 0
     glued_replacements = 0
+    manual_edits = 0
     for outcome in outcomes:
         quality[outcome.asr_quality] = quality.get(outcome.asr_quality, 0) + 1
         for failure in outcome.failures:
@@ -964,6 +966,8 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
                     implicit_asr_fixes += 1
             elif change.get("type") == "soft_thought_loss":
                 soft_thought_loss += 1
+            elif change.get("type") == "manual_edit":
+                manual_edits += 1
     return NormalizeStats(
         total=len(outcomes),
         proposed=sum(1 for item in outcomes if item.status == "proposed"),
@@ -987,6 +991,7 @@ def summarize(outcomes: list[NormalizeOutcome]) -> NormalizeStats:
         doubtful=quality.get("doubtful", 0),
         prompt_tokens=sum(item.prompt_tokens for item in outcomes),
         completion_tokens=sum(item.completion_tokens for item in outcomes),
+        manual_edits=manual_edits,
     )
 
 

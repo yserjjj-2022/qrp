@@ -12,6 +12,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from qa.db.workbook_repo import (
     InterviewRepository,
@@ -22,6 +23,7 @@ from qa.db.workbook_repo import (
     TextUnitRepository,
 )
 from qa.llm.base import LlmProvider
+from qa.pipeline.manual_edits import ManualEdits, load_manual_edits, manual_edits_path
 from qa.pipeline.normalize_l2 import (
     NormalizeOutcome,
     NormalizeStats,
@@ -153,6 +155,7 @@ def normalize_interview(
     *,
     version: int = 1,
     code_version: str = "",
+    manual_edits: ManualEdits | None = None,
 ) -> NormalizeResult:
     """Нормализовать все реплики интервью и записать L2.
 
@@ -163,6 +166,8 @@ def normalize_interview(
         provider: провайдер LLM; None — только детерминированный проход.
         version: версия L2.
         code_version: версия кода для записи в run.
+        manual_edits: разовые правки реплик; None — прочитать файл рядом с
+            выгрузками (отсутствие файла не ошибка).
     """
     interviews = InterviewRepository(conn)
     interview_db_id = interviews.interview_db_id_by_code(interview_code)
@@ -204,14 +209,22 @@ def normalize_interview(
     examples = load_examples()
     min_words = settings.m1b.min_words_for_model
     fuzzy = settings.m1b.fuzzy_config()
+    edits = (
+        manual_edits
+        if manual_edits is not None
+        else load_manual_edits(manual_edits_path(Path(settings.paths.exports), interview_code))
+    )
 
     outcomes: list[NormalizeOutcome] = []
     for index, (utterance_id, role, text, flag) in enumerate(utterances):
+        # Разовая правка применяется до модели и до детерминированного прохода:
+        # L1 остаётся неизменным, исправленный текст видит только L2.
+        edited_text, applied = edits.apply(utterance_id, text)
         outcome = normalize_utterance(
             utterance_id,
             role,
             bool(flag),
-            text,
+            edited_text,
             previous_question=_previous_question(utterances, index),
             lexicon=lexicon,
             markers=markers,
@@ -223,6 +236,14 @@ def normalize_interview(
             prompt_lexicon_filter=settings.m1b.prompt_lexicon_filter,
             prompt_lexicon_threshold=settings.m1b.prompt_lexicon_threshold,
         )
+        if applied:
+            outcome.changes = [
+                *outcome.changes,
+                *[
+                    {"type": "manual_edit", "from": edit.source, "to": edit.target, "utterance_id": utterance_id}
+                    for edit in applied
+                ],
+            ]
         outcomes.append(outcome)
 
     stats = summarize(outcomes)
@@ -241,6 +262,11 @@ def normalize_interview(
         "model_calls": stats.model_calls,
         "cached_calls": stats.cached_calls,
     }
+    if edits.path is not None:
+        # Хеш файла правок виден в прогоне, как хеш лексикона: изменение файла
+        # меняет результат и должно быть заметно (SPEC-M8, решение 4).
+        params["manual_edits"] = edits.count
+        params["manual_edits_hash"] = edits.file_hash
 
     conn.execute("SAVEPOINT normalize_l2")
     try:
