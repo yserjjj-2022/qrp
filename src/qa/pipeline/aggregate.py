@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from qa.db.analytics_repo import (
     AnalyticsRepository,
@@ -16,6 +16,14 @@ from qa.db.analytics_repo import (
     CodeRow,
     QuestionRow,
     ThemeRow,
+)
+from qa.pipeline.quote_view import (
+    PREFERRED_MIN_CHARS,
+    Quote,
+    QuoteEditor,
+    build_quote,
+    quote_source_text,
+    select_annotations,
 )
 from qa.settings import GroupsSettings, normalize_group
 
@@ -39,15 +47,6 @@ class AggregateError(Exception):
 
 
 @dataclass(frozen=True)
-class QuoteItem:
-    """Цитата темы: дословный срез L2 или вырезка с многоточием."""
-
-    code_name: str
-    text: str
-    question_identifier: str | None
-
-
-@dataclass(frozen=True)
 class ThemeCoverage:
     """Покрытие одной темы аннотациями (все, кроме отклонённых)."""
 
@@ -60,7 +59,8 @@ class ThemeCoverage:
     theme_codes: int
     covered_fragments: int
     cumulative: tuple[int, ...]
-    quotes: tuple[QuoteItem, ...]
+    quotes: tuple[Quote, ...]
+    annotations_detail: tuple[AnnotationRow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +126,8 @@ class CoverageReport:
     covered_fragments: int
     annotations_total: int
     annotations_verified: int
+    annotations: tuple[AnnotationRow, ...] = ()
+    code_names: dict[int, str] = field(default_factory=dict)
 
 
 def theme_status(annotations: int, low_min: int, high_min: int) -> str:
@@ -142,14 +144,14 @@ def theme_status(annotations: int, low_min: int, high_min: int) -> str:
 
 
 def truncate_quote(text: str, limit: int) -> str:
-    """Обрезать цитату по границе слова и отметить вырезку многоточием."""
-    if limit <= 0 or len(text) <= limit:
-        return text
-    cut = text[:limit]
-    space = cut.rfind(" ")
-    if space > 0:
-        cut = cut[:space]
-    return cut.rstrip(" ,;:—-") + " …"
+    """Обрезать цитату по границе слова и отметить вырезку `[…]`.
+
+    Обёртка над `qa.pipeline.quote_view.truncate_quote`: правило одно на
+    дашборд и отчёт, поэтому живёт в одном месте.
+    """
+    from qa.pipeline.quote_view import truncate_quote as cut
+
+    return cut(text, limit)[0]
 
 
 def quote_text(annotation: AnnotationRow, limit: int) -> str:
@@ -159,11 +161,9 @@ def quote_text(annotation: AnnotationRow, limit: int) -> str:
     цитата (SPEC-M6, критерий 9). Сохранённая `annotation.quote` используется
     только если позиций нет.
     """
-    if annotation.quote_start is not None and annotation.quote_end is not None:
-        sliced = annotation.l2_text[annotation.quote_start : annotation.quote_end]
-        if sliced:
-            return truncate_quote(sliced, limit)
-    return truncate_quote(annotation.quote, limit)
+    from qa.pipeline.quote_view import quote_source_text
+
+    return truncate_quote(quote_source_text(annotation), limit)
 
 
 def cumulative_codes(annotations: list[AnnotationRow]) -> tuple[int, ...]:
@@ -227,6 +227,39 @@ def _identifier_sort_key(identifier: str) -> tuple[int, str]:
     return (int(digits), identifier) if digits.isdigit() else (10**6, identifier)
 
 
+def _theme_quotes(
+    annotations: list[AnnotationRow],
+    code_names: dict[int, str],
+    limit: int,
+    max_chars: int,
+    editor: QuoteEditor | None,
+    min_chars: int,
+) -> tuple[Quote, ...]:
+    """Отобрать и оформить цитаты темы.
+
+    Отбор — `quote_view.select_annotations`: `garbled` не попадает, `doubtful`
+    идёт после `ok`. Правка моделью — только для отобранных цитат и только если
+    её включил оператор.
+    """
+    quotes: list[Quote] = []
+    for annotation in select_annotations(annotations, limit, min_chars=min_chars):
+        source = quote_source_text(annotation)
+        edited_text: str | None = None
+        rule = ""
+        if editor is not None:
+            edited_text, _reason, rule = editor(source)
+        quotes.append(
+            build_quote(
+                annotation,
+                code_names.get(annotation.code_id, ""),
+                max_chars,
+                edited_text=edited_text,
+                edit_rule=rule,
+            )
+        )
+    return tuple(quotes)
+
+
 def build_coverage(
     conn: sqlite3.Connection,
     interview_code: str,
@@ -236,12 +269,18 @@ def build_coverage(
     high_min: int,
     quotes_per_theme: int,
     quote_max_chars: int,
+    quote_editor: QuoteEditor | None = None,
+    quote_min_chars: int = PREFERRED_MIN_CHARS,
 ) -> CoverageReport:
     """Собрать модель покрытия интервью.
 
     База агрегатов — все аннотации, кроме `rejected`. Выборочный контроль не
     фильтр: проверенные вручную (`accepted`/`edited`) выводятся отдельным
     счётчиком «из них проверено», но не определяют покрытие.
+
+    Args:
+        quote_editor: необязательная правка цитаты моделью; None — без правки.
+            Правка применяется только к уже отобранным цитатам (SPEC-M8, C.3).
 
     Raises:
         AggregateError: интервью нет в БД или не загружена версия кодбука.
@@ -302,14 +341,15 @@ def build_coverage(
                 theme_codes=len(theme_code_ids),
                 covered_fragments=len({annotation.fragment_id for annotation in theme_annotations}),
                 cumulative=cumulative_codes(theme_annotations),
-                quotes=tuple(
-                    QuoteItem(
-                        code_name=code_names.get(annotation.code_id, ""),
-                        text=quote_text(annotation, quote_max_chars),
-                        question_identifier=annotation.question_identifier,
-                    )
-                    for annotation in theme_annotations[:quotes_per_theme]
+                quotes=_theme_quotes(
+                    theme_annotations,
+                    code_names,
+                    quotes_per_theme,
+                    quote_max_chars,
+                    quote_editor,
+                    quote_min_chars,
                 ),
+                annotations_detail=tuple(theme_annotations),
             )
         )
 
@@ -373,6 +413,8 @@ def build_coverage(
         covered_fragments=len({annotation.fragment_id for annotation in annotations}),
         annotations_total=len(annotations),
         annotations_verified=sum(1 for annotation in annotations if annotation.verified),
+        annotations=tuple(annotations),
+        code_names=code_names,
     )
 
 

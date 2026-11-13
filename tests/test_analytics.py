@@ -287,11 +287,11 @@ def test_quotes_are_slices(tmp_path: Path, settings: Settings) -> None:
 
 
 def test_truncate_quote_marks_cut() -> None:
-    """Длинная цитата режется по границе слова и получает многоточие."""
+    """Длинная цитата режется по границе слова и получает маркер вырезки `[…]`."""
     text = "Первый ответ про риски и проверку."
     truncated = truncate_quote(FRAGMENTS[0], 20)
-    assert truncated.endswith(" …")
-    assert truncated[:-2].rstrip() in text
+    assert truncated.endswith(" […]")
+    assert truncated.removesuffix(" […]").rstrip() in text
 
 
 def test_quotes_limited_by_config(tmp_path: Path, settings: Settings) -> None:
