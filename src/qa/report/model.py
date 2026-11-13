@@ -1,16 +1,24 @@
-"""Модель данных отчёта (M5).
+"""Модель данных отчёта (M5, расширена в M8).
 
 Dataclasses без HTML и без SQL: рендер отчёта принимает эту модель и не
 считает чисел сам (SPEC-M6, «Разделение слоёв»). Модуль не импортирует
 `qa.report.render`.
+
+Модель готова к агрегации нескольких интервью (SPEC-M8, D.3): происхождение
+хранится списком `interviews` (сейчас из одного элемента), а темы адресуются
+ключом `(узел, тема)` через `theme_index`. Одиночное поле `provenance`
+оставлено как свойство: отчёт по одному интервью читается как раньше.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from qa.db.analytics_repo import AnalyticsRepository
-from qa.pipeline.aggregate import HEURISTIC_CAPTION, CoverageReport
+from qa.pipeline.aggregate import HEURISTIC_CAPTION, CoverageReport, ThemeCoverage
+from qa.pipeline.expectations import Expectations, build_expectations
+from qa.pipeline.quote_view import QuoteEditor
+from qa.settings import Settings
 
 # Тип расшифровки фиксирован CONSTITUTION §6: в проекте один источник
 # транскриптов — машинная расшифровка с лёгкой редакцией.
@@ -57,12 +65,58 @@ class Limitation:
 
 
 @dataclass(frozen=True)
-class InterviewReport:
-    """Полный отчёт: происхождение, покрытие, ограничения."""
+class QuotePolicy:
+    """Что произошло с цитатами: обрезка, правка и по какому правилу.
 
-    provenance: Provenance
+    Строка о правках в начале блока цитат собирается из этих чисел, а не
+    пишется вручную: если правка выключена, отчёт не утверждает, что она была.
+    """
+
+    truncated: int = 0
+    edited: int = 0
+    rules: tuple[str, ...] = ()
+
+    @property
+    def note(self) -> str:
+        """Строка для читателя: что именно сделано с текстом цитат."""
+        if not self.truncated and not self.edited:
+            return (
+                "Цитаты приведены дословно: вырезки не было, правка модели не применялась. "
+                "Под каждой цитатой — оригинал с тайм-кодом."
+            )
+        parts = ["Цитаты частично отредактированы"]
+        if self.truncated:
+            parts.append(f"обрезка отмечена […]: {self.truncated}")
+        if self.edited:
+            rules = ", ".join(self.rules) if self.rules else "без названия правила"
+            parts.append(f"правка модели: {self.edited} (правило: {rules})")
+        return "; ".join(parts) + ". Оригинал приведён под каждой цитатой."
+
+
+@dataclass(frozen=True)
+class InterviewReport:
+    """Полный отчёт: происхождение, покрытие, ожидания, ограничения.
+
+    `interviews` — список интервью отчёта. Сейчас он всегда из одного
+    элемента, но поля `provenance` больше нет: при агрегации нескольких
+    интервью отчёт не придётся переделывать (SPEC-M8, D.3).
+    """
+
+    interviews: tuple[Provenance, ...]
     coverage: CoverageReport
     limitations: tuple[Limitation, ...]
+    expectations: Expectations = field(default_factory=lambda: Expectations(sections=(), overlap=0))
+    quote_policy: QuotePolicy = QuotePolicy()
+
+    @property
+    def provenance(self) -> Provenance:
+        """Происхождение единственного интервью отчёта."""
+        return self.interviews[0]
+
+    @property
+    def theme_index(self) -> dict[tuple[str, str], ThemeCoverage]:
+        """Темы по ключу `(узел, тема)` — ключ будущей агрегации интервью."""
+        return {(node.node, theme.theme): theme for node in self.coverage.nodes for theme in node.themes}
 
     @property
     def annotations_total(self) -> int:
@@ -174,6 +228,9 @@ def build_report(
     repo: AnalyticsRepository,
     *,
     snapshot_date: str,
+    settings: Settings | None = None,
+    extra_limitations: tuple[Limitation, ...] = (),
+    quote_editor: QuoteEditor | None = None,
 ) -> InterviewReport:
     """Собрать модель отчёта по готовому покрытию.
 
@@ -181,6 +238,13 @@ def build_report(
         coverage: покрытие интервью, уже посчитанное агрегацией.
         repo: репозиторий для списка прогонов (единственный источник SQL).
         snapshot_date: дата снимка чисел (ISO).
+        settings: настройки проекта; нужны для раздела «Ожидания и
+            рекомендации» (`m8.autonomy_codes`, `m8.advice_questions`). Без них
+            раздел пуст, а базовый отчёт M5 собирается как раньше.
+        extra_limitations: ограничения, которые знает только вызывающая
+            сторона (состояние конвейера: термины, выборка качества, правки).
+        quote_editor: правка цитат моделью; None — без правки. Тот же редактор,
+            что применён к цитатам тем: правило одно на весь отчёт.
 
     Returns:
         Модель отчёта для рендера.
@@ -206,8 +270,27 @@ def build_report(
         snapshot_run_id=coverage.run_id,
         runs=runs,
     )
+    expectations = (
+        build_expectations(
+            coverage,
+            settings.m8,
+            quote_max_chars=settings.m4.quote_max_chars,
+            quote_min_chars=settings.m8.quote_min_chars,
+            editor=quote_editor,
+        )
+        if settings is not None
+        else Expectations(sections=(), overlap=0)
+    )
+    quotes = tuple(quote for node in coverage.nodes for theme in node.themes for quote in theme.quotes)
+    policy = QuotePolicy(
+        truncated=sum(1 for quote in quotes if quote.truncated),
+        edited=sum(1 for quote in quotes if quote.edited),
+        rules=tuple(sorted({quote.edit_rule for quote in quotes if quote.edited and quote.edit_rule})),
+    )
     return InterviewReport(
-        provenance=provenance,
+        interviews=(provenance,),
         coverage=coverage,
-        limitations=_limitations(coverage),
+        limitations=_limitations(coverage) + tuple(extra_limitations),
+        expectations=expectations,
+        quote_policy=policy,
     )

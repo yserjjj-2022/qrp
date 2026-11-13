@@ -138,14 +138,15 @@ def test_model_does_not_import_render() -> None:
 
 
 def test_render_blocks_follow_order(tmp_path: Path, settings: Settings) -> None:
-    """Порядок блоков отчёта: происхождение, числа, дерево, цитаты, ограничения."""
+    """Порядок блоков отчёта: происхождение, числа, дерево, цитаты, ожидания, ограничения."""
     html = render_report(_report(tmp_path, settings))
     positions = [
         html.index("1. Происхождение"),
         html.index("2. Числа"),
         html.index("3. Дерево тем"),
         html.index("4. Цитаты"),
-        html.index("5. Ограничения"),
+        html.index("5. Ожидания и рекомендации"),
+        html.index("6. Ограничения"),
     ]
     assert positions == sorted(positions)
 

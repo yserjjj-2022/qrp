@@ -1,9 +1,14 @@
-"""Рендер HTML-отчёта (M5).
+"""Рендер HTML-отчёта (M5, расширен в M8).
 
 Один файл: инлайн-стили и SVG, без JavaScript и внешних ресурсов. Рендер не
 считает чисел: всё приходит в модели `InterviewReport` (SPEC-M6, «M5. Отчёт»).
-Порядок блоков обязателен: происхождение → числа → дерево с кривыми → цитаты
-→ ограничения.
+Порядок блоков обязателен: происхождение → числа → дерево с кривыми → цитаты →
+ожидания и рекомендации → ограничения.
+
+Цитата показывается вместе с проверяемым источником: под ней стоит строка
+«L2, тайм-код», а если текст обрезан или отредактирован — ещё и дословный
+оригинал (SPEC-M8, C.4). Когда текст совпадает с оригиналом, повторять его не
+нужно: строка источника и есть ссылка на запись.
 """
 
 from __future__ import annotations
@@ -11,6 +16,9 @@ from __future__ import annotations
 from html import escape
 
 from qa.pipeline.aggregate import STATUS_LABELS, CoverageReport, ThemeCoverage
+from qa.pipeline.expectations import Expectations, ExpectationSection
+from qa.pipeline.quote_view import Quote
+from qa.pipeline.terms_table import format_timecode
 from qa.report.model import InterviewReport
 
 _CSS = """
@@ -45,6 +53,13 @@ border-bottom:1px solid #eef1f5}
 blockquote{margin:0 0 8px;padding:8px 12px;border-left:3px solid #cfd5de;
 background:#fafbfc;color:#333c4c;font-size:13px}
 blockquote .src{display:block;color:var(--muted);font-size:11px;margin-top:4px}
+blockquote .orig{display:block;color:#4a5262;font-size:12px;margin-top:6px;
+padding-top:6px;border-top:1px dotted #cfd5de}
+blockquote .orig b{font-weight:600;color:var(--muted);font-size:11px;
+letter-spacing:.02em;text-transform:uppercase}
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:6px;
+background:#f2f4f8;color:#4a5262;margin-left:6px}
+.tag.doubtful{background:#fdf3d7;color:#7a5b00}
 .lim{margin:0;padding-left:18px}
 .lim li{margin:0 0 8px;font-size:14px}
 .note{color:var(--muted);font-size:13px;margin:10px 0 0}
@@ -244,6 +259,53 @@ def _theme_row(theme: ThemeCoverage, fragments_total: int) -> str:
     )
 
 
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """Склонение существительного при числе: 1 аннотация, 2 аннотации, 5 аннотаций."""
+    tail = abs(count) % 100
+    if 11 <= tail <= 14:
+        return many
+    last = tail % 10
+    if last == 1:
+        return one
+    if 2 <= last <= 4:
+        return few
+    return many
+
+
+def _annotations(count: int) -> str:
+    """Подпись счётчика аннотаций с правильным склонением."""
+    return f"{count} {_plural(count, 'аннотация', 'аннотации', 'аннотаций')}"
+
+
+def _quote_html(quote: Quote) -> str:
+    """Цитата с проверяемым источником.
+
+    Под цитатой — код и тайм-код записи L2; если текст обрезан или
+    отредактирован, ниже идёт дословный оригинал, иначе читателю не с чем
+    сверить правку (SPEC-M8, C.4). Сомнительный фрагмент помечен: цитата из
+    него не отбрасывается, но читатель должен это видеть.
+    """
+    tags = ""
+    if quote.quality == "doubtful":
+        tags += '<span class="tag doubtful">фрагмент doubtful</span>'
+    if quote.edited:
+        tags += '<span class="tag">правка модели</span>'
+    if quote.truncated:
+        tags += '<span class="tag">обрезано</span>'
+    timecode = format_timecode(quote.timecode) if quote.timecode is not None else "—"
+    source = f"L2 · тайм-код {timecode}"
+    if quote.question_identifier:
+        source += f" · вопрос {quote.question_identifier}"
+    original = ""
+    if quote.original_l2 and (quote.edited or quote.truncated):
+        original = f'<span class="orig"><b>оригинал L2</b> {escape(quote.original_l2)}</span>'
+    return (
+        f"<blockquote>«{escape(quote.text)}»{tags}"
+        f'<span class="src">код {escape(quote.code_name)} · {escape(source)}</span>'
+        f"{original}</blockquote>"
+    )
+
+
 def _quotes_block(report: InterviewReport) -> str:
     """Блок 4: цитаты по темам, только из аннотаций интервью."""
     parts: list[str] = []
@@ -251,13 +313,7 @@ def _quotes_block(report: InterviewReport) -> str:
         for theme in node.themes:
             if not theme.quotes:
                 continue
-            quotes = "".join(
-                f"<blockquote>«{escape(quote.text)}»"
-                f'<span class="src">код {escape(quote.code_name)}'
-                + (f" · вопрос {escape(quote.question_identifier)}" if quote.question_identifier else "")
-                + "</span></blockquote>"
-                for quote in theme.quotes
-            )
+            quotes = "".join(_quote_html(quote) for quote in theme.quotes)
             parts.append(f"<h3>{escape(node.node)} → {escape(theme.theme)}</h3>{quotes}")
     if not parts:
         return (
@@ -266,15 +322,66 @@ def _quotes_block(report: InterviewReport) -> str:
         )
     return (
         '<div class="card"><h2>4. Цитаты</h2>'
-        + "".join(parts)
-        + '<p class="note">Цитаты — срезы текста L2; вырезка отмечена многоточием.</p></div>'
+        f'<p class="note" style="margin:0 0 14px">{escape(report.quote_policy.note)}</p>' + "".join(parts) + "</div>"
+    )
+
+
+def _expectation_section(section: ExpectationSection) -> str:
+    """Подраздел «Ожиданий и рекомендаций»: счётчик, группы, цитаты."""
+    if not section.groups:
+        return (
+            f"<h3>{escape(section.title)} — {_annotations(section.annotations)}</h3>"
+            f'<p class="note" style="margin:0 0 6px">{escape(section.description)}</p>'
+            f'<p class="note" style="margin:0">Аннотаций нет: {escape(section.selector)}.</p>'
+        )
+    groups: list[str] = []
+    for group in section.groups:
+        codes = f" · коды: {', '.join(group.codes)}" if group.codes else ""
+        quotes = "".join(_quote_html(quote) for quote in group.quotes)
+        groups.append(
+            f'<p class="family">{escape(group.title)} — {_annotations(group.annotations)}{escape(codes)}</p>{quotes}'
+        )
+    return (
+        f"<h3>{escape(section.title)} — {_annotations(section.annotations)}</h3>"
+        f'<p class="note" style="margin:0 0 10px">{escape(section.description)} '
+        f"Отбор: {escape(section.selector)}.</p>" + "".join(groups)
+    )
+
+
+def _expectations_block(report: InterviewReport) -> str:
+    """Блок 5: ожидания и рекомендации респондентов (два подраздела).
+
+    Счётчики подразделов не суммируются: одна аннотация может попасть в оба,
+    поэтому итог не выводится как общее число (SPEC-M8, решение 2).
+    """
+    expectations: Expectations = report.expectations
+    if not expectations.sections:
+        return (
+            '<div class="card"><h2>5. Ожидания и рекомендации</h2>'
+            '<p class="note" style="margin:0">Раздел не настроен: списки кодов и вопросов '
+            "задаются в config.yaml (m8).</p></div>"
+        )
+    if expectations.overlap == 1:
+        overlap = "Одна аннотация входит в оба подраздела, поэтому счётчики подразделов не суммируются."
+    elif expectations.overlap > 1:
+        overlap = (
+            f"{_annotations(expectations.overlap)} входят в оба подраздела, "
+            "поэтому счётчики подразделов не суммируются."
+        )
+    else:
+        overlap = "Подразделы не пересекаются, но и не суммируются: у них разные основания отбора."
+    sections = "".join(_expectation_section(section) for section in expectations.sections)
+    return (
+        '<div class="card"><h2>5. Ожидания и рекомендации</h2>'
+        f'<p class="note" style="margin:0 0 12px">{escape(overlap)}</p>'
+        f"{sections}</div>"
     )
 
 
 def _limitations_block(report: InterviewReport) -> str:
-    """Блок 5: ограничения отчёта."""
+    """Блок 6: ограничения отчёта."""
     items = "".join(f"<li>{escape(item.text)}</li>" for item in report.limitations)
-    return f'<div class="card"><h2>5. Ограничения</h2><ul class="lim">{items}</ul></div>'
+    return f'<div class="card"><h2>6. Ограничения</h2><ul class="lim">{items}</ul></div>'
 
 
 def render_report(report: InterviewReport) -> str:
@@ -298,6 +405,7 @@ def render_report(report: InterviewReport) -> str:
         f"{_numbers_block(report)}\n"
         f"{_tree_block(report)}\n"
         f"{_quotes_block(report)}\n"
+        f"{_expectations_block(report)}\n"
         f"{_limitations_block(report)}\n"
         '<p class="note">Статический HTML без JavaScript и внешних ресурсов. '
         "Отчёт описывает одно интервью и не делает выводов о группе.</p>\n"
