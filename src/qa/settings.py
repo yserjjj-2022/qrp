@@ -165,6 +165,48 @@ class M4Settings(BaseModel):
         return self
 
 
+class M8Settings(BaseModel):
+    """Настройки оркестрации и представления цитат (M8).
+
+    `autonomy_codes` и `advice_questions` задают два подраздела отчёта
+    «Ожидания и рекомендации»: в кодбуке нет признака «ожидание /
+    рекомендация / барьер», поэтому отбор идёт по кодам и по вопросам гайда,
+    а сами списки живут в конфиге, а не в коде (SPEC-M8, решение 2).
+
+    `quote_edit_enabled` по умолчанию выключен: правка цитаты моделью — это
+    изменение текста респондента в отчёте, и включать её должен оператор
+    осознанно (SPEC-M8, C.3). `quote_edit_max_change_share` — верхняя доля
+    изменённых символов, при которой правка ещё принимается.
+
+    `quality_sample_min` / `quality_sample_max` — размер выборки ворот 2:
+    оператор просматривает горстку реплик, а не всё интервью (решение 3).
+
+    `quality_sample_enabled` по умолчанию выключен. Ворота 2 проверяли
+    читаемость L2 сверкой с L1, но L2 и не должен исправлять ошибки
+    распознавания: он убирает заикания, повторы и мусорные звуки, приводит
+    термины к лексикону, а опечатки ASR остаются опечатками. Сверять в такой
+    проверке нечего, поэтому шаг не производит файл, который никто не
+    откроет, и не добавляет в отчёт вечное «не подтверждено». Включение
+    возвращает прежнее поведение целиком.
+    """
+
+    autonomy_codes: list[str] = Field(default_factory=lambda: ["C1", "C2", "C3", "C4"])
+    advice_questions: list[str] = Field(default_factory=lambda: ["17", "18", "21", "22"])
+    quote_edit_enabled: bool = False
+    quote_edit_max_change_share: float = Field(default=0.25, gt=0, le=1)
+    quote_min_chars: int = Field(default=80, ge=0)
+    quality_sample_enabled: bool = False
+    quality_sample_min: int = Field(default=10, ge=1)
+    quality_sample_max: int = Field(default=15, ge=1)
+
+    @model_validator(mode="after")
+    def _check_sample_bounds(self) -> M8Settings:
+        """Верхняя граница выборки не может быть меньше нижней."""
+        if self.quality_sample_max < self.quality_sample_min:
+            raise ValueError("m8: quality_sample_max должен быть не меньше quality_sample_min")
+        return self
+
+
 class M3Settings(BaseModel):
     """Настройки лексических векторов и кластеризации `OTH` (M3)."""
 
@@ -327,6 +369,7 @@ class Settings(BaseModel):
     m2: M2Settings = Field(default_factory=M2Settings)
     m3: M3Settings = Field(default_factory=M3Settings)
     m4: M4Settings = Field(default_factory=M4Settings)
+    m8: M8Settings = Field(default_factory=M8Settings)
     workbook: WorkbookSettings = WorkbookSettings()
     groups: GroupsSettings = GroupsSettings()
     lexicon_status_map: dict[str, str] = Field(default_factory=dict)
