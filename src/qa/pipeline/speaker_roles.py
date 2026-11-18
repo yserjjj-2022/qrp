@@ -93,9 +93,6 @@ def _check_rebuild_allowed(repo: InterviewRepository, interview_db_id: int, inte
     new_terms = repo.new_terms_on_utterances(interview_db_id)
     if new_terms:
         blockers.append(f"кандидаты новых терминов (new_term): {new_terms}")
-    golden = repo.golden_refs_on_utterances(interview_db_id)
-    if golden:
-        blockers.append(f"золотой набор (golden_sample, utterance:<id>): {golden}")
     text_units = repo.text_unit_refs_on_utterances(interview_db_id)
     if text_units:
         blockers.append(f"единицы L2 (text_unit): {text_units}")

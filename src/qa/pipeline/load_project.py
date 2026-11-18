@@ -1,4 +1,4 @@
-"""Загрузка необязательных листов проекта: лексикон, маркеры, интервью, золотой набор, факты.
+"""Загрузка необязательных листов проекта: лексикон, маркеры, интервью, факты.
 
 Отсутствующий лист не ошибка: используются умолчания из config.yaml.
 Решения, принятые в review-terms, имеют приоритет над листом и не перезаписываются.
@@ -14,7 +14,6 @@ from typing import Any
 
 from qa.db.workbook_repo import (
     CodebookRepository,
-    GoldenRepository,
     InterviewRepository,
     LexiconRepository,
     MarkerRepository,
@@ -32,7 +31,6 @@ SHEET_LEXICON = "Лексикон"
 SHEET_MARKERS = "Маркеры_неуверенности"
 SHEET_INTERVIEWS = "Интервью"
 SHEET_SPEAKERS = "Роли_говорящих"
-SHEET_GOLDEN = "Золотой_набор"
 
 
 @dataclass
@@ -278,26 +276,6 @@ def _backfill_labels(
         result.discrepancies.extend(notes)
 
 
-def _load_golden(workbook: WorkbookData, repo: GoldenRepository, result: LoadProjectResult) -> None:
-    """Загрузить золотой набор из листа книги."""
-    sheet = workbook.sheet(SHEET_GOLDEN)
-    if sheet is None or sheet.is_empty:
-        result.missing_sheets.append(SHEET_GOLDEN)
-        return
-    for row in sheet.rows:
-        text_l1 = _text(row, "text_l1")
-        if text_l1 is None:
-            continue
-        repo.upsert(
-            interview_code=_text(row, "interview_code"),
-            utterance_ref=_text(row, "utterance_ref"),
-            text_l1=text_l1,
-            text_l2_manual=_text(row, "text_l2_manual"),
-            source="workbook",
-        )
-        result.counts["golden"] = result.counts.get("golden", 0) + 1
-
-
 def _load_facts(
     workbook: WorkbookData,
     workbook_version_id: int,
@@ -375,7 +353,6 @@ def load_project(
             transcripts_dir=transcripts_dir,
             groups=groups,
         )
-    _load_golden(workbook, GoldenRepository(conn), result)
     _load_facts(workbook, workbook_version_id, ReferenceFactRepository(conn), workbook_settings, result)
     conn.commit()
 

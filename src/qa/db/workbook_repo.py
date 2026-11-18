@@ -379,36 +379,6 @@ class MarkerRepository:
         return [str(row[0]) for row in rows]
 
 
-class GoldenRepository:
-    """Золотой набор: реплики L1 и ручной L2."""
-
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
-
-    def upsert(
-        self,
-        interview_code: str | None,
-        utterance_ref: str | None,
-        text_l1: str,
-        text_l2_manual: str | None,
-        source: str,
-    ) -> None:
-        """Вставить или обновить запись золотого набора."""
-        self._conn.execute(
-            "INSERT INTO golden_sample (interview_code, utterance_ref, text_l1, text_l2_manual, source)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(interview_code, utterance_ref, text_l1) DO UPDATE SET"
-            " text_l2_manual = COALESCE(excluded.text_l2_manual, golden_sample.text_l2_manual),"
-            " source = excluded.source",
-            (interview_code, utterance_ref, text_l1, text_l2_manual, source),
-        )
-
-    def count(self) -> int:
-        """Число записей."""
-        row = self._conn.execute("SELECT COUNT(*) FROM golden_sample").fetchone()
-        return int(row[0])
-
-
 class ReferenceFactRepository:
     """Эталонные факты из листов «Факты_*»."""
 
@@ -631,19 +601,6 @@ class InterviewRepository:
         """Группа респондента интервью (None — не задана)."""
         row = self._conn.execute('SELECT "group" FROM interview WHERE id = ?', (interview_db_id,)).fetchone()
         return None if row is None or row[0] is None else str(row[0])
-
-    def golden_refs_on_utterances(self, interview_db_id: int) -> int:
-        """Сколько записей золотого набора ссылается на реплики интервью (utterance:<id>)."""
-        rows = self._conn.execute("SELECT utterance_ref FROM golden_sample WHERE utterance_ref IS NOT NULL").fetchall()
-        ids = set(self.utterance_ids(interview_db_id))
-        linked = 0
-        for (ref,) in rows:
-            prefix, _, value = str(ref).partition(":")
-            if prefix != "utterance" or not value.isdigit():
-                continue
-            if int(value) in ids:
-                linked += 1
-        return linked
 
     def text_unit_refs_on_utterances(self, interview_db_id: int) -> int:
         """Сколько единиц L2 ссылается на реплики интервью (таблица появляется в M1b)."""

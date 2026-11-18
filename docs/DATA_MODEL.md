@@ -310,20 +310,6 @@
 | note | TEXT | Примечание |
 | source | TEXT NOT NULL DEFAULT 'workbook' | workbook или default |
 
-### golden_sample
-Золотой набор: реплики L1 и ручной L2 (лист «Золотой_набор» или xlsx экспорта).
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| id | INTEGER PRIMARY KEY | Автоинкремент |
-| interview_code | TEXT | Код интервью |
-| utterance_ref | TEXT | Ссылка вида utterance:<id> |
-| text_l1 | TEXT NOT NULL | Текст L1 |
-| text_l2_manual | TEXT | Ручной L2 |
-| source | TEXT NOT NULL DEFAULT 'workbook' | workbook / import |
-| created_at | TIMESTAMP | |
-| UNIQUE(interview_code, utterance_ref, text_l1) | | |
-
 ### reference_fact
 Эталонные факты из листов с префиксом «Факты_».
 

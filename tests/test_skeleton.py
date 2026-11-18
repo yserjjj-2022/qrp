@@ -65,7 +65,6 @@ class TestSettings:
     def test_paths_defaults(self, settings: Settings) -> None:
         assert settings.paths.workbook == "data/inputs/Rabochaya_kniga_proekta_v4.xlsx"
         assert settings.paths.transcripts == "data/inputs/transcripts"
-        assert settings.paths.golden == "data/golden"
 
     def test_workbook_sheet_classes(self, settings: Settings) -> None:
         workbook = settings.workbook

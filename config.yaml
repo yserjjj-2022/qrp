@@ -11,7 +11,6 @@ paths:
   cache: data/cache
   exports: data/exports
   reports: data/reports
-  golden: data/golden
 
 db_path: data/db/interviews.db
 data_dir: data
@@ -51,12 +50,6 @@ m1b:
   # (fuzzy_lexicon_threshold): фильтр решает, что показать модели, поэтому
   # ошибаться должен в сторону включения лишнего термина.
   prompt_lexicon_threshold: 0.60
-  # Ниже — пороги будущих проверок (золотой набор, отношение длин, выборочное
-  # ревью). Сейчас не используются, оставлены для калибровки.
-  filler_density_threshold: 0.05
-  len_ratio_min: 0.6
-  len_ratio_max: 1.1
-  review_sample_share: 0.10
 
 m2:
   # Сколько последних реплик интервьюера попадает в промпт при определении
@@ -151,7 +144,6 @@ workbook:
     - "Маркеры_неуверенности"
     - "Интервью"
     - "Роли_говорящих"
-    - "Золотой_набор"
   optional_prefixes: ["Факты_"]
   ignored_sheets: ["Справка", "Эталон_Финам", "Было_стало"]
   ignored_prefixes: ["_"]
@@ -253,12 +245,6 @@ workbook:
         speaker_label: {header: "метка_говорящего", type: str, required: true}
         role: {header: "роль", type: str, required: true}
         words: {header: "слов", type: int}
-    Золотой_набор:
-      columns:
-        interview_code: {header: "id_интервью", type: str, required: true}
-        utterance_ref: {header: "ссылка_на_реплику", type: str}
-        text_l1: {header: "текст_L1", type: text, required: true}
-        text_l2_manual: {header: "текст_L2_вручную", type: text}
 
   # Листы с префиксом «Факты_» используют эту схему колонок.
   prefix_sheets:

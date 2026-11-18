@@ -255,18 +255,6 @@ class TestUnchangedRoles:
 class TestRebuildBlockers:
     """Пересборка реплик блокируется любыми ссылками на них."""
 
-    def test_golden_sample_blocks(self, db: sqlite3.Connection, transcript: Path, settings: Settings) -> None:
-        _load(db, transcript, settings)
-        utterance_id = db.execute("SELECT id FROM utterance ORDER BY id LIMIT 1").fetchone()[0]
-        db.execute(
-            "INSERT INTO golden_sample (interview_code, utterance_ref, text_l1) VALUES (?, ?, ?)",
-            ("R01", f"utterance:{utterance_id}", "текст"),
-        )
-        db.commit()
-
-        with pytest.raises(SpeakerRolesError, match="golden_sample"):
-            apply_speaker_roles(db, "R01", {"A": "OBSERVER"}, settings.pipeline, transcript_path=transcript)
-
     def test_annotation_blocks(self, db: sqlite3.Connection, tmp_path: Path, settings: Settings) -> None:
         path = build_workbook(tmp_path / "book.xlsx")
         load_codebook(db, path, settings.workbook, groups=settings.groups)

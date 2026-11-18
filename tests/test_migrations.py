@@ -38,7 +38,6 @@ _WORKBOOK_TABLES = [
     "glossary_term",
     "lexicon",
     "uncertainty_marker",
-    "golden_sample",
     "reference_fact",
     "interview_speaker",
     "new_term",
@@ -68,6 +67,7 @@ class TestMigrations:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         for table in _TABLES + _WORKBOOK_TABLES:
             assert table in tables, f"Таблица {table} не найдена"
+        assert "golden_sample" not in tables
         assert "_guard_empty" not in tables
         assert "_guard_fk" not in tables
         cols = {row[1] for row in conn.execute("PRAGMA table_info(interview)").fetchall()}

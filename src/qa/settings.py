@@ -90,18 +90,12 @@ class M1bSettings(BaseModel):
     модели. `fuzzy_lexicon_threshold` и `fuzzy_lexicon_short_threshold` задают
     нечёткое сопоставление с лексиконом в детерминированном проходе: для слов
     короче `fuzzy_short_word_length` действует более строгий порог.
-    Остальные ключи оставлены для отложенных частей M1b (золотой набор,
-    проверка отношения длин, review-выборка) и сейчас не используются.
     """
 
     min_words_for_model: int = Field(default=4, ge=1)
     fuzzy_lexicon_threshold: float = Field(default=0.80, gt=0, le=1)
     fuzzy_lexicon_short_threshold: float = Field(default=0.93, gt=0, le=1)
     fuzzy_short_word_length: int = Field(default=5, ge=2)
-    filler_density_threshold: float = Field(default=0.05, gt=0, le=1)
-    len_ratio_min: float = Field(default=0.6, gt=0)
-    len_ratio_max: float = Field(default=1.1, gt=0)
-    review_sample_share: float = Field(default=0.10, ge=0, le=1)
     # Фильтрация лексикона в промпте: в вызов уходят только термины, похожие на
     # текст реплики. Полный лексикон в каждом промпте делал ключ кэша
     # зависимым от всего глоссария, поэтому пополнение обнуляло кэш интервью.
@@ -300,7 +294,6 @@ class PathsSettings(BaseModel):
     cache: str = "data/cache"
     exports: str = "data/exports"
     reports: str = "data/reports"
-    golden: str = "data/golden"
 
 
 class ColumnSpec(BaseModel):
@@ -460,7 +453,6 @@ class Settings(BaseModel):
             self.paths.cache,
             self.paths.exports,
             self.paths.reports,
-            self.paths.golden,
             str(Path(self.db_path).parent),
         ):
             Path(value).mkdir(parents=True, exist_ok=True)

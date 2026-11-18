@@ -221,38 +221,6 @@ def cmd_review_terms(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_export_golden_sample(args: argparse.Namespace) -> int:
-    """Выгрузить реплики L1 в xlsx для ручной нормализации."""
-    settings = _load_settings(_db_from_args(args))
-    run_id = setup_logging(settings.log_level)
-    from qa.pipeline.golden import GOLDEN_FILENAME, export_golden_sample
-
-    output = Path(args.output) if args.output else Path(settings.paths.golden) / GOLDEN_FILENAME
-    conn = _open_db(settings)
-    try:
-        result = export_golden_sample(conn, output, n=args.n, interview_id=args.interview_id)
-    finally:
-        conn.close()
-    print(f"[{run_id}] золотой набор: {result.n_rows} строк -> {result.path}")
-    return 0
-
-
-def cmd_import_golden(args: argparse.Namespace) -> int:
-    """Загрузить заполненный золотой набор (файл или лист книги)."""
-    settings = _load_settings(_db_from_args(args))
-    run_id = setup_logging(settings.log_level)
-    from qa.pipeline.golden import GOLDEN_FILENAME, import_golden
-
-    path = Path(args.file) if args.file else Path(settings.paths.golden) / GOLDEN_FILENAME
-    conn = _open_db(settings)
-    try:
-        result = import_golden(conn, path)
-    finally:
-        conn.close()
-    print(f"[{run_id}] золотой набор импортирован: строк={result.n_rows}, с L2={result.n_filled}")
-    return 0
-
-
 def cmd_llm_ping(args: argparse.Namespace) -> int:
     """Проверить эндпоинт и модель на синтетическом запросе."""
     from pydantic import ValidationError
@@ -852,18 +820,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_review = subparsers.add_parser("review-terms", help="Ревью кандидатов новых терминов (M1b)")
     _add_db_option(p_review)
     p_review.set_defaults(func=cmd_review_terms)
-
-    p_export = subparsers.add_parser("export-golden-sample", help="Выгрузить реплики L1 для золотого набора")
-    p_export.add_argument("--n", type=int, default=40, help="Сколько реплик выбрать (default: 40)")
-    p_export.add_argument("--interview-id", help="Только это интервью")
-    p_export.add_argument("--output", help="Путь к xlsx; по умолчанию data/golden/golden_sample.xlsx")
-    _add_db_option(p_export)
-    p_export.set_defaults(func=cmd_export_golden_sample)
-
-    p_import = subparsers.add_parser("import-golden", help="Загрузить заполненный золотой набор")
-    p_import.add_argument("file", nargs="?", help="Путь к xlsx; по умолчанию data/golden/golden_sample.xlsx")
-    _add_db_option(p_import)
-    p_import.set_defaults(func=cmd_import_golden)
 
     p_ping = subparsers.add_parser("llm-ping", help="Проверить LLM-эндпоинт на синтетическом запросе")
     p_ping.add_argument("--normalize", action="store_true", help="Использовать LLM_MODEL_NORMALIZE")
