@@ -77,28 +77,25 @@ def test_plan_reports_state_without_writing(tmp_path: Path, settings: Settings) 
     before = (_run_count(conn), _unit_count(conn))
     runner = PipelineRunner(conn, "R01", settings)
     plan = runner.plan()
-    assert [step.number for step in plan] == list(range(1, 11))
+    assert [step.number for step in plan] == list(range(1, 9))
     assert (_run_count(conn), _unit_count(conn)) == before
     conn.close()
 
 
-def test_gate_one_stops_pipeline(tmp_path: Path, settings: Settings) -> None:
-    """Неразобранные кандидаты терминов останавливают конвейер на шаге 4."""
+def test_terms_gate_removed_from_run(tmp_path: Path, settings: Settings) -> None:
+    """M7b: неразобранные кандидаты терминов больше не останавливают run."""
     conn = build_m8_db(tmp_path, _spec(terms=True))
-    runner = PipelineRunner(conn, "R01", settings)
-    result = runner.execute()
-    assert result.stopped_at_gate == 4
-    assert not result.all_done
-    # L2 не тронут: шаг 5 не выполнялся.
-    assert _unit_count(conn) == len(UTTERANCES)
+    result = PipelineRunner(conn, "R01", settings).execute()
+    assert result.stopped_at_gate is None
+    assert result.all_done
+    assert _unit_count(conn) > len(UTTERANCES) - 1
     conn.close()
 
 
-def test_skip_terms_passes_gate(tmp_path: Path, settings: Settings) -> None:
-    """`--skip-terms` проходит ворота 1 и доходит до отчёта."""
+def test_skip_terms_flag_is_accepted(tmp_path: Path, settings: Settings) -> None:
+    """Устаревший `--skip-terms` не мешает: ворот терминов в run нет."""
     conn = build_m8_db(tmp_path, _spec(terms=True))
-    runner = PipelineRunner(conn, "R01", settings, skip_terms=True)
-    result = runner.execute()
+    result = PipelineRunner(conn, "R01", settings, skip_terms=True).execute()
     assert result.stopped_at_gate is None
     assert result.all_done
     assert (tmp_path / "reports" / "report_R01.html").is_file()
@@ -118,27 +115,44 @@ def test_second_run_changes_nothing(tmp_path: Path, settings: Settings) -> None:
     conn.close()
 
 
-def test_quality_gate_disabled_by_default(tmp_path: Path, settings: Settings) -> None:
-    """Ворота 2 выключены по умолчанию: файла нет, конвейер идёт дальше."""
-    conn = build_m8_db(tmp_path, _spec())
-    result = PipelineRunner(conn, "R01", settings).execute()
-    assert result.stopped_at_gate is None
-    assert not (tmp_path / "exports" / "quality_sample_R01.xlsx").exists()
-    step8 = next(step for step in result.steps if step.number == 8)
-    assert step8.status == "skipped"
-    assert "выключены" in step8.detail
-    conn.close()
-
-
-def test_quality_gate_exports_when_enabled(tmp_path: Path, settings: Settings) -> None:
-    """Включённые ворота 2 выгружают выборку и не блокируют конвейер."""
+def test_quality_sample_removed_from_run(tmp_path: Path, settings: Settings) -> None:
+    """M7b: шаг выборки качества убран из run, даже если ворота включены."""
     settings.m8.quality_sample_enabled = True
     conn = build_m8_db(tmp_path, _spec())
     result = PipelineRunner(conn, "R01", settings).execute()
     assert result.stopped_at_gate is None
-    assert (tmp_path / "exports" / "quality_sample_R01.xlsx").is_file()
-    step8 = next(step for step in result.steps if step.number == 8)
-    assert step8.status == "done"
+    assert not (tmp_path / "exports" / "quality_sample_R01.xlsx").exists()
+    assert all("качество" not in step.title for step in result.steps)
+    conn.close()
+
+
+def test_run_stops_before_segmentation_on_open_forms(tmp_path: Path, settings: Settings) -> None:
+    """M7b: слова для оператора останавливают run перед сегментацией."""
+    conn = build_m8_db(tmp_path, _spec())
+    for table in ("annotation", "fragment_coding", "fragment", "text_unit"):
+        conn.execute(f"DELETE FROM {table}")
+    conn.execute("UPDATE utterance SET text = 'Я подключил сенжин к счёту'")
+    conn.commit()
+    result = PipelineRunner(conn, "R01", settings).execute()
+    assert result.stopped_at_gate == 5
+    gate = result.steps[-1]
+    assert gate.status == "gate"
+    assert "Помогите опознать" in gate.detail
+    assert (tmp_path / "exports" / "terms_qrp.xlsx").is_file()
+    assert conn.execute("SELECT COUNT(*) FROM fragment").fetchone()[0] == 0
+    conn.close()
+
+
+def test_no_wait_passes_segmentation(tmp_path: Path, settings: Settings) -> None:
+    """`--no-wait` идёт дальше, применив правила пустой ячейки."""
+    conn = build_m8_db(tmp_path, _spec())
+    for table in ("annotation", "fragment_coding", "fragment", "text_unit"):
+        conn.execute(f"DELETE FROM {table}")
+    conn.execute("UPDATE utterance SET text = 'Я подключил сенжин к счёту'")
+    conn.commit()
+    result = PipelineRunner(conn, "R01", settings, no_wait=True).execute()
+    assert result.stopped_at_gate is None
+    assert conn.execute("SELECT COUNT(*) FROM fragment").fetchone()[0] > 0
     conn.close()
 
 

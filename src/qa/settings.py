@@ -201,6 +201,39 @@ class M8Settings(BaseModel):
         return self
 
 
+class M7bSettings(BaseModel):
+    """Настройки памяти терминов и подсказок оператору (M7b).
+
+    Система находит слова, которых нет ни в словаре, ни в лексиконе, и
+    предлагает варианты: по созвучию (код) и по смыслу (модель). Решение
+    оператора запоминается, на следующих интервью известное применяется кодом.
+
+    `hint_samples` — сколько выборок делает модель на одно слово: уверенность
+    варианта равна доле выборок за него. `hint_temperature` и `hint_seed`
+    задают параметры выборок; каждая выборка получает `seed + i`, поэтому кэш
+    различает их и повторный прогон не тратит вызовы.
+    """
+
+    project_name: str = "qrp"
+    hint_samples: int = Field(default=3, ge=1)
+    hint_temperature: float = Field(default=0.7, gt=0, le=2)
+    hint_seed: int = Field(default=0, ge=0)
+    hint_confidence_threshold: float = Field(default=0.67, gt=0, le=1)
+    hint_max: int = Field(default=5, ge=1)
+    context_utterances: int = Field(default=3, ge=0)
+    memory_neighbours: int = Field(default=5, ge=0)
+    phonetic_threshold: float = Field(default=0.55, gt=0, le=1)
+    phonetic_short_threshold: float = Field(default=0.70, gt=0, le=1)
+    phonetic_short_length: int = Field(default=5, ge=2)
+    auto_apply_defaults: bool = True
+    manual_edits_enabled: bool = False
+    wait_on_terms: bool = True
+
+    def terms_path(self, exports: str) -> Path:
+        """Путь к таблице терминов проекта."""
+        return Path(exports) / f"terms_{self.project_name}.xlsx"
+
+
 class M3Settings(BaseModel):
     """Настройки лексических векторов и кластеризации `OTH` (M3)."""
 
@@ -362,6 +395,7 @@ class Settings(BaseModel):
     m2: M2Settings = Field(default_factory=M2Settings)
     m3: M3Settings = Field(default_factory=M3Settings)
     m4: M4Settings = Field(default_factory=M4Settings)
+    m7b: M7bSettings = Field(default_factory=M7bSettings)
     m8: M8Settings = Field(default_factory=M8Settings)
     workbook: WorkbookSettings = WorkbookSettings()
     groups: GroupsSettings = GroupsSettings()

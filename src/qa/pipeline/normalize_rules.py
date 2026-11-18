@@ -273,10 +273,17 @@ def comparison_tokens(text: str) -> list[str]:
 
 @dataclass(frozen=True)
 class LexiconEntry:
-    """Термин лексикона: каноническая форма и варианты ASR-искажений."""
+    """Термин лексикона: каноническая форма и варианты ASR-искажений.
+
+    `status` и `source` заполняются при чтении из БД и нужны журналу правок:
+    замена из памяти помечается как решение (`review`/`auto`), а не как
+    подстановка термина из книги. Для записей книги оба поля пустые.
+    """
 
     canonical: str
     variants: tuple[str, ...] = ()
+    status: str = ""
+    source: str = ""
 
 
 @dataclass(frozen=True)

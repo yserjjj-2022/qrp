@@ -375,7 +375,8 @@ class TestSuspectWords:
         assert "реплика" in prompt
         assert "вопрос" in prompt
         assert "предметная область" in prompt
-        assert "эсипи" in prompt
+        # M7b: подстановки {lexicon} больше нет — термины не подставляет модель.
+        assert "эсипи" not in prompt
         assert "не знаю" in prompt
 
     def test_build_prompt_default_domain_hint(self) -> None:
@@ -1002,7 +1003,9 @@ class TestNormalizeUtterance:
         )
         prompt = provider.prompts[0]
         assert "расскажите про подключение" in prompt
-        assert "MCP" in prompt
+        # M7b: термины подставляет код по памяти решений, а не модель,
+        # поэтому лексикон в промпт не входит.
+        assert "MCP" not in prompt
         assert "не знаю" in prompt
         assert "примеры" in prompt
 
@@ -1200,9 +1203,9 @@ _OTHER_TERM = LexiconEntry(canonical="ребалансировка", variants=("
 
 
 class TestPromptLexiconFilter:
-    """Фильтр сужает только подстановку {lexicon}; проверки остаются на полном."""
+    """M7b: лексикон в промпт не подставляется ни при каком флаге."""
 
-    def test_irrelevant_terms_not_in_prompt(self) -> None:
+    def test_terms_not_in_prompt(self) -> None:
         provider = FakeProvider([_ok("Подключил MCP в приложении.")])
         normalize_utterance(
             1,
@@ -1218,10 +1221,12 @@ class TestPromptLexiconFilter:
             prompt_lexicon_filter=True,
         )
         prompt = provider.prompts[0]
-        assert "MCP" in prompt
+        # «MCP» в промпте — уже заменённый текст реплики, а не подстановка
+        # лексикона: посторонний термин в промпт не попадает.
         assert "ребалансировка" not in prompt
+        assert "{lexicon}" not in prompt
 
-    def test_full_lexicon_without_filter(self) -> None:
+    def test_terms_not_in_prompt_without_filter(self) -> None:
         provider = FakeProvider([_ok("Подключил MCP в приложении.")])
         normalize_utterance(
             1,
@@ -1236,8 +1241,8 @@ class TestPromptLexiconFilter:
             min_words=4,
         )
         prompt = provider.prompts[0]
-        assert "MCP" in prompt
-        assert "ребалансировка" in prompt
+        assert "ребалансировка" not in prompt
+        assert "{lexicon}" not in prompt
 
     def test_checks_use_full_lexicon(self) -> None:
         """Термин не попал в промпт, но проверка латиницы его всё равно знает."""

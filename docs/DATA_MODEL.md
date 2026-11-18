@@ -296,7 +296,7 @@
 | canonical | TEXT NOT NULL UNIQUE | Каноническая форма |
 | variants_json | TEXT NOT NULL DEFAULT '[]' | Варианты ASR (JSON) |
 | definition | TEXT | Определение |
-| status | TEXT NOT NULL DEFAULT 'proposed' | proposed / approved / rejected |
+| status | TEXT NOT NULL DEFAULT 'proposed' | proposed / approved / rejected; память M7b: review / auto / keep / unreadable |
 | source | TEXT NOT NULL DEFAULT 'workbook' | workbook или review (review приоритетнее) |
 | updated_at | TIMESTAMP | Обновлено |
 
@@ -415,3 +415,20 @@
 `proposed`, а в отчёт `load-project` попадает предупреждение с номером строки листа.
 Решения `review-terms` (`lexicon.source = 'review'`) приоритетнее листа «Лексикон»
 и не перезаписываются.
+
+### Память решений терминов (M7b)
+`apply-terms` пишет решения таблицы `data/exports/terms_<проект>.xlsx` в лексикон.
+Отдельной таблицы нет: статус памяти живёт в `lexicon.status`, `source` остаётся
+`review` (схема БД не менялась).
+
+| status | Смысл | Применение в L2 |
+|---|---|---|
+| `review` | решение оператора | вариант заменяется каноном |
+| `auto` | автозамена по подсказке | вариант заменяется каноном |
+| `keep` | оператор оставил слово | форма известна, замены нет |
+| `unreadable` | оператор пометил неразборчивым | форма заменяется на `[неразборчиво]` |
+
+Приоритет при конфликте: `review` > `auto` > `workbook`. Автозамена не
+перезаписывает решение оператора, а решение оператора заменяет автозамену.
+Конфликт двух решений оператора по одной форме не применяется и остаётся в
+таблице с пояснением.

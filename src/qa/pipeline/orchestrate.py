@@ -5,12 +5,11 @@
 функциями стадий. Отдельной таблицы статусов нет — повторный запуск безопасен
 именно потому, что каждая стадия сама проверяет, сделана ли она.
 
-Ворота 1 (таблица терминов) блокируют: пока у интервью есть неразобранные
-кандидаты, шаги L2 и дальше не выполняются. Ворота 2 (выборка качества) по
-умолчанию выключены: L2 не исправляет ошибки распознавания, поэтому сверка с L1
-ничего не решает. При `m8.quality_sample_enabled=true` ворота возвращаются
-целиком и, как раньше, не блокируют: выборка выгружается, конвейер идёт дальше,
-а отсутствие маркера попадает в ограничения отчёта.
+С M7b в пути по умолчанию нет ворот терминов, шага таблицы терминов, выборки
+качества и разовых правок: термины опознаёт память решений (`apply-terms`).
+Осталась одна остановка — перед сегментацией, если после нормализации есть
+слова для оператора: `Помогите опознать N слов: <файл>`. Флаг `--no-wait`
+проходит дальше и применяет правила пустой ячейки.
 """
 
 from __future__ import annotations
@@ -130,13 +129,19 @@ class PipelineRunner:
         *,
         skip_terms: bool = False,
         transcripts_dir: Path | None = None,
+        no_wait: bool = False,
     ) -> None:
         self._conn = conn
         self._code = interview_code
         self._settings = settings
         self._repo = PipelineRepository(conn)
+        # Флаг сохранён для совместимости вызовов: ворот терминов в run больше
+        # нет, значение ни на что не влияет.
         self._skip_terms = skip_terms
         self._transcripts_dir = transcripts_dir
+        self._no_wait = no_wait
+        self._open_forms = 0
+        self._terms_path = ""
         self._interview_db_id: int | None = None
         self._results: list[StepResult] = []
 
@@ -162,11 +167,9 @@ class PipelineRunner:
             "книга",
             "проект",
             "интервью",
-            "ворота 1: термины",
             "L2 (нормализация)",
             "фрагменты",
             "кодирование",
-            "ворота 2: качество",
             "дашборд",
             "отчёт",
         )
@@ -190,46 +193,21 @@ class PipelineRunner:
             interview_db_id = self.interview_db_id
             if interview_db_id is None:
                 return STATUS_BLOCKED, "сначала загрузите интервью"
-            proposed = repo.proposed_term_count(interview_db_id)
-            if not proposed:
-                return STATUS_SKIPPED, "неразобранных кандидатов нет"
-            if self._skip_terms:
-                return STATUS_GATE, f"--skip-terms: {proposed} кандидатов остаются proposed"
-            return STATUS_GATE, f"к решению: {proposed}"
-        if number == 5:
-            interview_db_id = self.interview_db_id
-            if interview_db_id is None:
-                return STATUS_BLOCKED, "сначала загрузите интервью"
             units = repo.text_unit_count(interview_db_id)
             return (STATUS_SKIPPED, f"единиц L2: {units}") if units else (STATUS_DONE, "нормализовать")
-        if number == 6:
+        if number == 5:
             interview_db_id = self.interview_db_id
             if interview_db_id is None:
                 return STATUS_BLOCKED, "сначала загрузите интервью"
             fragments = repo.fragment_count(interview_db_id)
             return (STATUS_SKIPPED, f"фрагментов: {fragments}") if fragments else (STATUS_DONE, "разбить на фрагменты")
-        if number == 7:
+        if number == 6:
             interview_db_id = self.interview_db_id
             if interview_db_id is None:
                 return STATUS_BLOCKED, "сначала загрузите интервью"
             annotations = repo.annotation_count(interview_db_id)
             return (STATUS_SKIPPED, f"аннотаций: {annotations}") if annotations else (STATUS_DONE, "закодировать")
-        if number == 8:
-            if not self._settings.m8.quality_sample_enabled:
-                # Ворота 2 выключены оператором: L2 не исправляет ошибки
-                # распознавания, поэтому сверка с L1 ничего не проверяет.
-                return STATUS_SKIPPED, "ворота 2 выключены (m8.quality_sample_enabled=false)"
-            from qa.pipeline.quality_sample import marker_matches, quality_sample_path
-
-            sample = quality_sample_path(Path(self._settings.paths.exports), self._code)
-            if marker_matches(sample):
-                return STATUS_SKIPPED, "выборка просмотрена"
-            if sample.is_file():
-                # Повторная выгрузка меняла бы хеш и обесценивала маркер:
-                # выборка уже лежит, её остаётся просмотреть.
-                return STATUS_SKIPPED, "выборка ждёт просмотра (файл уже выгружен)"
-            return STATUS_DONE, "выгрузить выборку"
-        if number == 9:
+        if number == 7:
             path = Path(self._settings.paths.exports) / f"dashboard_{self._code}.html"
             if _artifact_is_fresh(path, self._repo.latest_run_started_at()):
                 return STATUS_SKIPPED, "файл новее последнего прогона"
@@ -241,28 +219,37 @@ class PipelineRunner:
 
     def execute(self) -> RunResult:
         """Выполнять шаги по порядку, остановившись на блокирующих воротах."""
-        for number in range(1, 11):
-            title = self._titles()[number - 1]
+        titles = self._titles()
+        for number in range(1, len(titles) + 1):
+            title = titles[number - 1]
             status, detail = self._evaluate(number)
             if status in (STATUS_SKIPPED, STATUS_BLOCKED):
                 self._results.append(StepResult(number, title, status, detail))
-                if status == STATUS_BLOCKED and number in (3, 5, 6, 7):
+                if status == STATUS_BLOCKED and number in (3, 4, 5, 6):
                     # Дальше идти нельзя: шаг невозможен без предыдущего.
                     return RunResult(self._code, self._results, stopped_at_gate=None, all_done=False)
                 continue
-            if status == STATUS_GATE:
-                if number == 4 and self._skip_terms:
-                    self._results.append(
-                        StepResult(number, title, STATUS_GATE, detail, ["ворота пройдены по --skip-terms"])
-                    )
-                    continue
-                self._results.append(StepResult(number, title, STATUS_GATE, detail))
-                return RunResult(self._code, self._results, stopped_at_gate=number, all_done=False)
             result = self._perform(number, title)
             self._results.append(result)
             if result.status == STATUS_BLOCKED:
                 return RunResult(self._code, self._results, stopped_at_gate=None, all_done=False)
+            if number == 4 and result.status == STATUS_DONE and self._should_wait():
+                # Остановка перед сегментацией: фрагменты строятся по тексту,
+                # и опознавать слова после их появления уже поздно.
+                self._results.append(
+                    StepResult(
+                        number + 1,
+                        titles[number],
+                        STATUS_GATE,
+                        f"Помогите опознать {self._open_forms} слов: {self._terms_path}",
+                    )
+                )
+                return RunResult(self._code, self._results, stopped_at_gate=number + 1, all_done=False)
         return RunResult(self._code, self._results, stopped_at_gate=None, all_done=True)
+
+    def _should_wait(self) -> bool:
+        """Есть ли причина остановиться перед сегментацией."""
+        return bool(self._open_forms) and self._settings.m7b.wait_on_terms and not self._no_wait
 
     def _perform(self, number: int, title: str) -> StepResult:
         """Выполнить шаг через существующую функцию стадии."""
@@ -273,15 +260,13 @@ class PipelineRunner:
                 return self._step_project(number, title)
             if number == 3:
                 return self._step_interview(number, title)
-            if number == 5:
+            if number == 4:
                 return self._step_normalize(number, title)
-            if number == 6:
+            if number == 5:
                 return self._step_structure(number, title)
-            if number == 7:
+            if number == 6:
                 return self._step_code(number, title)
-            if number == 8:
-                return self._step_quality(number, title)
-            if number == 9:
+            if number == 7:
                 return self._step_dashboard(number, title)
             return self._step_report(number, title)
         except Exception as exc:  # noqa: BLE001 - стадии бросают разные типы ошибок
@@ -364,8 +349,9 @@ class PipelineRunner:
         )
 
     def _step_normalize(self, number: int, title: str) -> StepResult:
-        """Нормализовать реплики в L2."""
+        """Нормализовать реплики в L2 и собрать слова для оператора."""
         from qa.pipeline.normalize import normalize_interview
+        from qa.pipeline.terms_help import terms_path
         from qa.version import code_version
 
         result = normalize_interview(
@@ -376,6 +362,8 @@ class PipelineRunner:
             version=1,
             code_version=code_version(),
         )
+        self._open_forms = result.open_forms
+        self._terms_path = str(terms_path(self._settings))
         if result.skipped:
             return StepResult(number, title, STATUS_SKIPPED, "L2 уже записан")
         stats = result.stats
@@ -383,7 +371,7 @@ class PipelineRunner:
             number,
             title,
             STATUS_DONE,
-            f"единиц={stats.total}, вызовов={stats.model_calls}, правок={stats.manual_edits}",
+            f"единиц={stats.total}, вызовов={stats.model_calls}, слов для оператора: {result.open_forms}",
         )
 
     def _step_structure(self, number: int, title: str) -> StepResult:
@@ -426,28 +414,6 @@ class PipelineRunner:
             STATUS_DONE,
             f"фрагментов={stats.fragments}, coded={stats.coded}, unmarked={stats.unmarked}, "
             f"аннотаций={stats.annotations}",
-        )
-
-    def _step_quality(self, number: int, title: str) -> StepResult:
-        """Выгрузить выборку качества L2 (ворота 2, не блокируют)."""
-        from qa.pipeline.quality_sample import export_quality_sample, quality_sample_path
-
-        if not self._settings.m8.quality_sample_enabled:
-            return StepResult(number, title, STATUS_SKIPPED, "ворота 2 выключены")
-
-        output = quality_sample_path(Path(self._settings.paths.exports), self._code)
-        result = export_quality_sample(
-            self._conn,
-            self._code,
-            output,
-            min_rows=self._settings.m8.quality_sample_min,
-            max_rows=self._settings.m8.quality_sample_max,
-        )
-        return StepResult(
-            number,
-            title,
-            STATUS_DONE,
-            f"реплик={result.n_rows} -> {result.path.name}; выборка не блокирует конвейер",
         )
 
     def _step_dashboard(self, number: int, title: str) -> StepResult:
@@ -533,10 +499,11 @@ def format_run_result(result: RunResult) -> list[str]:
             lines.append(f"   {extra}")
     if result.all_done:
         lines.append("Всё сделано: следующих шагов нет.")
-    elif result.stopped_at_gate == 4:
+    elif result.stopped_at_gate is not None:
         lines.append(
-            "Остановка на воротах 1: заполните таблицу терминов и выполните import-terms, "
-            "затем повторите run. Флаг --skip-terms проходит ворота без таблицы."
+            "Остановка перед сегментацией: заполните лист «Нужна помощь» в таблице "
+            "терминов и выполните apply-terms, затем повторите run. "
+            "Флаг --no-wait проходит дальше, применив правила пустой ячейки."
         )
     return lines
 

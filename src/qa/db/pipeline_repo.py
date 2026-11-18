@@ -136,6 +136,31 @@ class PipelineRepository:
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
+    def l2_texts_with_timecodes(self, interview_db_id: int, version: int) -> list[tuple[int, str, int | None]]:
+        """Единицы L2 интервью с тайм-кодом реплики: (id, текст, тайм-код)."""
+        rows = self._conn.execute(
+            """
+            SELECT t.id, t.text,
+                   (SELECT MIN(turn.start_sec) FROM turn, json_each(u.turn_ids) j
+                     WHERE turn.id = j.value)
+              FROM text_unit t
+              JOIN utterance u ON u.id = t.utterance_id
+             WHERE u.interview_id = ? AND t.version = ?
+             ORDER BY t.id
+            """,
+            (interview_db_id, version),
+        ).fetchall()
+        return [(int(unit_id), str(text), None if start is None else int(start)) for unit_id, text, start in rows]
+
+    def interviews_with_l2(self) -> list[tuple[int, str]]:
+        """Интервью, у которых есть записанный L2: (id, внешний код)."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT i.id, i.id_external FROM interview i"
+            " JOIN utterance u ON u.interview_id = i.id"
+            " JOIN text_unit t ON t.utterance_id = u.id ORDER BY i.id_external"
+        ).fetchall()
+        return [(int(interview_id), str(code)) for interview_id, code in rows]
+
     def max_l2_version(self, interview_db_id: int) -> int:
         """Наибольшая версия L2 интервью (0 — единиц нет)."""
         row = self._conn.execute(

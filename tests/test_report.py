@@ -96,7 +96,10 @@ def test_provenance_has_transcript_type_and_snapshot(tmp_path: Path, settings: S
     """Происхождение содержит тип расшифровки, дату и прогон снимка."""
     report = _report(tmp_path, settings)
     provenance = report.provenance
-    assert provenance.transcript_type == "машинная расшифровка с лёгкой редакцией"
+    assert provenance.transcript_type == (
+        "Машинная расшифровка; термины и неузнанные слова исправлены автоматически "
+        "и по подсказкам оператора; оригинал и тайм-код приведены под цитатой."
+    )
     assert provenance.snapshot_date == "2026-11-11"
     assert provenance.snapshot_run_id == 1
     assert provenance.group == "Не торгующие"

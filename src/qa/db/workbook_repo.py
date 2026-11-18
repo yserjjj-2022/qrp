@@ -353,6 +353,90 @@ class LexiconRepository:
             )
         return True
 
+    def form_owner(self, form: str) -> tuple[str, str] | None:
+        """Где форма уже закреплена: (канон, статус) или None.
+
+        Форма ищется среди вариантов и среди канонов со статусом памяти
+        (`keep`, `unreadable`): у них канон совпадает с самой формой, потому
+        что замены нет. `source` здесь не различает оператора и автозамену:
+        миграции нет, автозамена живёт с `source='review'` и `status='auto'`.
+        """
+        folded = form.casefold()
+        for canonical, data in self.all_terms().items():
+            status = str(data.get("status") or "")
+            if canonical.casefold() == folded and status in ("keep", "unreadable"):
+                return canonical, status
+            for variant in data.get("variants") or []:
+                if str(variant).casefold() == folded:
+                    return canonical, status
+        return None
+
+    def set_form_decision(self, form: str, target: str, status: str) -> str:
+        """Записать решение по форме: замена, «оставить» или «неразборчиво».
+
+        Args:
+            form: форма из расшифровки.
+            target: канон для замены; для `keep`/`unreadable` — сама форма.
+            status: `review` (решение оператора), `auto` (автозамена),
+                `keep` («оставить»), `unreadable` (`[неразборчиво]`).
+
+        Returns:
+            `applied` — записано; `unchanged` — уже так; `operator_kept` —
+            автозамена не тронула решение оператора; `conflict` — форма уже
+            привязана к другому канону решением оператора.
+        """
+        if status not in ("review", "auto", "keep", "unreadable"):
+            msg = f"Недопустимый статус решения: {status!r}"
+            raise ValueError(msg)
+        owner = self.form_owner(form)
+        if owner is not None:
+            owner_canonical, owner_status = owner
+            if owner_status == "review" and status != "review":
+                return "operator_kept"
+            if owner_status == "review" and status == "review" and owner_canonical != target:
+                return "conflict"
+            if owner_canonical == target:
+                if owner_status == status:
+                    return "unchanged"
+                self._conn.execute(
+                    "UPDATE lexicon SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE canonical = ?",
+                    (status, owner_canonical),
+                )
+                return "applied"
+            self._remove_variant(owner_canonical, form)
+
+        if status in ("keep", "unreadable"):
+            self._conn.execute(
+                "INSERT INTO lexicon (canonical, variants_json, definition, status, source)"
+                " VALUES (?, '[]', NULL, ?, 'review')"
+                " ON CONFLICT(canonical) DO UPDATE SET status = excluded.status,"
+                " variants_json = '[]', source = 'review', updated_at = CURRENT_TIMESTAMP",
+                (target, status),
+            )
+            return "applied"
+
+        self._conn.execute(
+            "INSERT INTO lexicon (canonical, variants_json, definition, status, source)"
+            " VALUES (?, '[]', NULL, ?, 'review')"
+            " ON CONFLICT(canonical) DO UPDATE SET status = excluded.status,"
+            " source = 'review', updated_at = CURRENT_TIMESTAMP",
+            (target, status),
+        )
+        self.add_variant(target, form)
+        return "applied"
+
+    def _remove_variant(self, canonical: str, form: str) -> None:
+        """Убрать форму из вариантов термина (перед перепривязкой решения)."""
+        row = self._conn.execute("SELECT variants_json FROM lexicon WHERE canonical = ?", (canonical,)).fetchone()
+        if row is None:
+            return
+        folded = form.casefold()
+        remaining = [str(item) for item in json.loads(row[0] or "[]") if str(item).casefold() != folded]
+        self._conn.execute(
+            "UPDATE lexicon SET variants_json = ?, updated_at = CURRENT_TIMESTAMP WHERE canonical = ?",
+            (json.dumps(remaining, ensure_ascii=False), canonical),
+        )
+
 
 class MarkerRepository:
     """Маркеры неуверенности."""
@@ -888,6 +972,22 @@ class TextUnitRepository:
             (interview_db_id, version),
         ).fetchone()
         return int(row[0]) if row is not None else 0
+
+    def rows_for_interview(self, interview_db_id: int, version: int) -> list[tuple[int, str, str]]:
+        """Единицы L2 интервью: (id, текст, журнал изменений)."""
+        rows = self._conn.execute(
+            "SELECT t.id, t.text, t.changes_json FROM text_unit t JOIN utterance u ON u.id = t.utterance_id"
+            " WHERE u.interview_id = ? AND t.version = ? ORDER BY t.id",
+            (interview_db_id, version),
+        ).fetchall()
+        return [(int(unit_id), str(text), str(changes or "[]")) for unit_id, text, changes in rows]
+
+    def update_text(self, unit_id: int, text: str, changes_json: str) -> None:
+        """Переписать текст единицы L2 и её журнал изменений."""
+        self._conn.execute(
+            "UPDATE text_unit SET text = ?, changes_json = ? WHERE id = ?",
+            (text, changes_json, unit_id),
+        )
 
     def run_id_for_version(self, interview_db_id: int, version: int) -> int | None:
         """Прогон, которым записана версия L2 интервью (None — записей нет).

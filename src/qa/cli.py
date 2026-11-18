@@ -657,7 +657,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_id = setup_logging(settings.log_level)
     conn = _open_db(settings)
     try:
-        runner = PipelineRunner(conn, args.interview, settings, skip_terms=args.skip_terms)
+        runner = PipelineRunner(
+            conn,
+            args.interview,
+            settings,
+            skip_terms=args.skip_terms,
+            no_wait=args.no_wait,
+        )
         if args.dry_run:
             plan = runner.plan()
             print(f"[{run_id}] run {args.interview} dry-run: записи в БД не будет")
@@ -679,10 +685,36 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     for index, line in enumerate(format_run_result(result)):
         print(f"[{run_id}] {line}" if index == 0 else line)
-    if result.stopped_at_gate == 4:
+    if result.stopped_at_gate is not None:
         warning = warn_names_map()
         if warning is not None:
             print(f"  ! {warning}")
+    return 0
+
+
+def cmd_apply_terms(args: argparse.Namespace) -> int:
+    """Применить решения таблицы терминов и пересобрать L2 (M7b)."""
+    from qa.pipeline.terms_help import TermsTableError, apply_terms
+
+    settings = _load_settings(_db_from_args(args))
+    run_id = setup_logging(settings.log_level)
+    conn = _open_db(settings)
+    try:
+        result = apply_terms(conn, settings, args.interview)
+    except TermsTableError as exc:
+        print(f"[{run_id}] apply-terms: ошибка — {exc}")
+        return 1
+    finally:
+        conn.close()
+    print(
+        f"[{run_id}] apply-terms: строк={result.rows}, применено={result.applied}, "
+        f"автозамен={result.auto}, сохранено решений оператора={result.kept}, "
+        f"конфликтов={result.conflicts}, пересобрано единиц L2={result.rebuilt}"
+    )
+    for line in result.details:
+        print(f"  {line}")
+    for code in result.skipped:
+        print(f"  ! {code}: есть аннотации — L2 не пересобирался (заморозка)")
     return 0
 
 
@@ -882,10 +914,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--skip-terms",
         action="store_true",
-        help="Пройти ворота 1 без таблицы терминов: кандидаты остаются proposed",
+        help="Устарел: ворот терминов в run больше нет, флаг ничего не меняет",
+    )
+    p_run.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Не останавливаться перед сегментацией: применить правила пустой ячейки и идти дальше",
     )
     _add_db_option(p_run)
     p_run.set_defaults(func=cmd_run)
+
+    p_apply_terms = subparsers.add_parser(
+        "apply-terms",
+        help="Применить решения таблицы терминов и пересобрать L2 (M7b)",
+    )
+    p_apply_terms.add_argument(
+        "interview",
+        nargs="?",
+        help="Код интервью (R01); без кода решения применяются ко всем интервью без аннотаций",
+    )
+    _add_db_option(p_apply_terms)
+    p_apply_terms.set_defaults(func=cmd_apply_terms)
 
     p_export_terms = subparsers.add_parser("export-terms", help="Выгрузить таблицу терминов интервью (M8)")
     p_export_terms.add_argument("interview", help="Код интервью (R01), уже загруженного в БД")

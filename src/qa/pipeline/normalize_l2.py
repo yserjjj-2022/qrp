@@ -35,7 +35,6 @@ from qa.pipeline.normalize_rules import (
     is_service_word,
     lemma_of,
     normalize_deterministic,
-    relevant_lexicon,
     suspect_words,
 )
 
@@ -708,6 +707,43 @@ def run_checks_detailed(
     )
 
 
+def _mark_memory_decisions(outcome: NormalizeOutcome, lexicon: list[LexiconEntry]) -> None:
+    """Пометить замены из памяти решений как `decision`.
+
+    Точная замена варианта из книги остаётся `term`: это подстановка
+    справочника. Замена, пришедшая из решения оператора или автозамены
+    (`status` = `review`/`auto`), помечается решением: отчёт должен показать
+    исходную форму под цитатой (`corrected_word`).
+    """
+    by_canonical = {
+        entry.canonical: entry for entry in lexicon if entry.status in ("review", "auto") and entry.variants
+    }
+    if not by_canonical:
+        return
+    marked: list[dict[str, Any]] = []
+    for change in outcome.changes:
+        if change.get("type") != "term" or change.get("fuzzy") or change.get("glued"):
+            marked.append(change)
+            continue
+        entry = by_canonical.get(str(change.get("to")))
+        if entry is None:
+            marked.append(change)
+            continue
+        position = outcome.text.casefold().find(str(change.get("to")).casefold())
+        marked.append(
+            {
+                "type": "decision",
+                "from": change.get("from"),
+                "to": change.get("to"),
+                "position": max(0, position),
+                "accepted": entry.status,
+                "confidence": 1.0,
+                "corrected_word": True,
+            }
+        )
+    outcome.changes = marked
+
+
 def normalize_utterance(
     utterance_id: int,
     role: str,
@@ -764,19 +800,15 @@ def normalize_utterance(
     )
 
     if provider is None or not should_use_model(role, is_backchannel, text, min_words):
+        _mark_memory_decisions(outcome, lexicon)
         return outcome
 
-    # Фильтр считается только для реплик, которые реально идут в модель:
-    # для остальных подстановка не нужна.
-    prompt_lexicon = (
-        relevant_lexicon(deterministic.text, lexicon, suspect, prompt_lexicon_threshold)
-        if prompt_lexicon_filter
-        else lexicon
-    )
+    # M7b: лексикон в промпт не подставляется. Термины применяет код по
+    # памяти решений, поэтому ключ кэша больше не зависит от глоссария.
     prompt = build_prompt(
         deterministic.text,
         previous_question,
-        prompt_lexicon,
+        lexicon,
         markers,
         examples,
         suspect,
@@ -800,7 +832,9 @@ def normalize_utterance(
     outcome.prompt_tokens = result.prompt_tokens
     outcome.completion_tokens = result.completion_tokens
     outcome.cached = result.cached
-    return _apply_model_output(outcome, deterministic.text, result.data, markers, lexicon)
+    outcome = _apply_model_output(outcome, deterministic.text, result.data, markers, lexicon)
+    _mark_memory_decisions(outcome, lexicon)
+    return outcome
 
 
 def _at_least_doubtful(quality: str) -> str:

@@ -68,6 +68,8 @@ class NormalizeResult:
     lexicon_changed: bool = False
     lexicon_run_hash: str = ""
     lexicon_current_hash: str = ""
+    # Слов, для которых нужен оператор (форм в таблице проекта).
+    open_forms: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,15 +94,41 @@ class DryRunReport:
     already_done: bool
 
 
+UNREADABLE = "[неразборчиво]"
+
+
 def load_lexicon(conn: sqlite3.Connection) -> list[LexiconEntry]:
-    """Термины лексикона со статусом не rejected."""
+    """Термины лексикона со статусом не rejected.
+
+    Статусы памяти M7b:
+    - `keep` — форма известна, но замены нет: вариант не добавляется, и
+      детерминированный проход её не трогает;
+    - `unreadable` — форма заменяется на `[неразборчиво]`;
+    - `review`/`auto` — обычная замена варианта на канон, приоритет
+      `review > auto > workbook` задан в `LexiconRepository.set_form_decision`.
+    """
     terms = LexiconRepository(conn).all_terms()
     entries: list[LexiconEntry] = []
     for canonical, data in terms.items():
-        if data.get("status") == "rejected":
+        status = str(data.get("status") or "")
+        if status == "rejected":
             continue
+        source = str(data.get("source") or "")
         variants = tuple(str(item) for item in data.get("variants") or [])
-        entries.append(LexiconEntry(canonical=canonical, variants=variants))
+        if status == "keep":
+            entries.append(LexiconEntry(canonical=canonical, status=status, source=source))
+            continue
+        if status == "unreadable":
+            entries.append(
+                LexiconEntry(
+                    canonical=UNREADABLE,
+                    variants=(canonical,),
+                    status=status,
+                    source=source,
+                )
+            )
+            continue
+        entries.append(LexiconEntry(canonical=canonical, variants=variants, status=status, source=source))
     return entries
 
 
@@ -156,6 +184,7 @@ def normalize_interview(
     version: int = 1,
     code_version: str = "",
     manual_edits: ManualEdits | None = None,
+    hint_providers: list[LlmProvider] | None = None,
 ) -> NormalizeResult:
     """Нормализовать все реплики интервью и записать L2.
 
@@ -167,7 +196,9 @@ def normalize_interview(
         version: версия L2.
         code_version: версия кода для записи в run.
         manual_edits: разовые правки реплик; None — прочитать файл рядом с
-            выгрузками (отсутствие файла не ошибка).
+            выгрузками, если `m7b.manual_edits_enabled`.
+        hint_providers: провайдеры выборок подсказок (по одному на выборку);
+            None — построить из настроек, пустой список — без модели.
     """
     interviews = InterviewRepository(conn)
     interview_db_id = interviews.interview_db_id_by_code(interview_code)
@@ -212,7 +243,11 @@ def normalize_interview(
     edits = (
         manual_edits
         if manual_edits is not None
-        else load_manual_edits(manual_edits_path(Path(settings.paths.exports), interview_code))
+        else (
+            load_manual_edits(manual_edits_path(Path(settings.paths.exports), interview_code))
+            if settings.m7b.manual_edits_enabled
+            else ManualEdits()
+        )
     )
 
     outcomes: list[NormalizeOutcome] = []
@@ -301,6 +336,8 @@ def normalize_interview(
     conn.execute("RELEASE SAVEPOINT normalize_l2")
     conn.commit()
 
+    open_forms = _publish_open_forms(conn, interview_code, settings, lexicon, hint_providers)
+
     logger.info(
         "L2 %s: единиц=%d, proposed=%d, rejected=%d, вызовов=%d",
         interview_code,
@@ -317,7 +354,74 @@ def normalize_interview(
         run_id=run_id,
         model_used=model_used,
         outcomes=outcomes,
+        open_forms=open_forms,
     )
+
+
+def _publish_open_forms(
+    conn: sqlite3.Connection,
+    interview_code: str,
+    settings: Settings,
+    lexicon: list[LexiconEntry],
+    hint_providers: list[LlmProvider] | None,
+) -> int:
+    """Дописать формы без решения в таблицу проекта и вернуть их число.
+
+    Подсказки строятся и без модели: созвучие, склейка и разделение работают
+    детерминированно. Модель лишь оценивает кандидатов по смыслу, поэтому
+    отсутствие провайдера не мешает показать оператору таблицу.
+    """
+    from qa.pipeline.terms_help import HelpRow, collect_open_forms, terms_path, upsert_terms_table
+    from qa.pipeline.terms_memory import build_hints
+
+    opened = collect_open_forms(conn, interview_code, lexicon)
+    if not opened:
+        return 0
+    providers = hint_providers if hint_providers is not None else _default_hint_providers(settings)
+    terms = LexiconRepository(conn).all_terms()
+    rows: list[HelpRow] = []
+    for item in opened:
+        hints = build_hints(
+            item.form,
+            lexicon,
+            settings.m7b,
+            context=item.context,
+            providers=providers,
+            terms=terms,
+        )
+        rows.append(
+            HelpRow(
+                form=item.form,
+                frequency=item.frequency,
+                places=item.places,
+                context=item.context,
+                hints=tuple(hints),
+                note="нет в словаре" + ("; есть созвучные" if any(hint.confidence > 0 for hint in hints) else ""),
+            )
+        )
+    upsert_terms_table(terms_path(settings), rows)
+    logger.info("M7b: форм для оператора в %s: %d -> %s", interview_code, len(rows), terms_path(settings))
+    return len(rows)
+
+
+def _default_hint_providers(settings: Settings) -> list[LlmProvider]:
+    """Провайдеры выборок подсказок из настроек.
+
+    Каждая выборка получает свою температуру и зерно, поэтому это отдельные
+    экземпляры: параметры входят в ключ кэша и не могут меняться у одного.
+    """
+    if settings.llm.provider == "stub":
+        return []
+    from qa.llm import provider_from_settings
+
+    return [
+        provider_from_settings(
+            settings,
+            normalize=True,
+            extra={"temperature": settings.m7b.hint_temperature, "seed": settings.m7b.hint_seed + index},
+        )
+        for index in range(settings.m7b.hint_samples)
+    ]
 
 
 def load_prompt_text() -> str:
